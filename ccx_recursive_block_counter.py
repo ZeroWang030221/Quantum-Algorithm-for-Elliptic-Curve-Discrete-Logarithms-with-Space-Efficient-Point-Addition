@@ -104,6 +104,12 @@ def _definition_cache_key(inst: Any) -> tuple[Any, ...]:
 
 def count_instruction_recursive(inst: Any, *, policy: CounterPolicy, cache: dict[tuple[Any, ...], Counter]) -> Counter:
     name = getattr(inst, "name", "<unnamed>").lower()
+    # Normalize primitive inverse spellings used by compatibility runtimes.
+    # This does not weaken opaque rejection: only known primitive daggers are
+    # accepted, while every unknown definitionless instruction still raises.
+    base_name = name[:-3] if name.endswith("_dg") else name
+    if base_name in PRIMITIVE_COUNTS or base_name == "swap":
+        name = base_name
 
     if policy.skip_alg3_steps and name.startswith("alg3_step_real_t"):
         return Counter({"meta::skipped_alg3_step": 1})
@@ -131,7 +137,10 @@ def count_instruction_recursive(inst: Any, *, policy: CounterPolicy, cache: dict
 
     definition = getattr(inst, "definition", None)
     if definition is None:
-        return Counter({f"OPAQUE::{name}": 1})
+        raise RuntimeError(
+            f"definitionless instruction {name!r} encountered during recursive counting; "
+            "resource accounting must never silently count an opaque block as one gate"
+        )
 
     key = _definition_cache_key(inst)
     if key in cache:
@@ -162,7 +171,9 @@ def count_gate_or_circuit(obj: Any, *, policy: Optional[CounterPolicy] = None) -
         return count_circuit_recursive(obj, policy=policy)
     definition = getattr(obj, "definition", None)
     if definition is None:
-        return Counter({f"OPAQUE::{getattr(obj, 'name', '<unnamed>').lower()}": 1})
+        raise RuntimeError(
+            f"definitionless instruction {getattr(obj, 'name', '<unnamed>')!r} encountered during recursive counting"
+        )
     return count_circuit_recursive(definition, policy=policy)
 
 

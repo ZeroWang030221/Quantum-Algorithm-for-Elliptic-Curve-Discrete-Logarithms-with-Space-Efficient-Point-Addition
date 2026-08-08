@@ -124,8 +124,15 @@ except ImportError:  # Formula/test mode can still build X/CX/CCX circuits witho
             return g
 
 
-_phi = (math.sqrt(5.0) + 1.0) / 2.0
-C_EEA = 1.0 / math.log2(_phi)
+_rho = 2.0 + math.sqrt(3.0)
+_lambda_eea = _rho ** (1.0 / 3.0)
+# Revised Appendix A.1: lambda=(2+sqrt(3))^(1/3), c=1/log2(lambda).
+C_EEA = 1.0 / math.log2(_lambda_eea)
+# Appendix A.2 defines eta=((4*sqrt(3)-3)/13)*lambda^2 and
+# delta=-log_lambda(eta).  Compute the constant from that exact expression
+# rather than using the rounded decimal printed in the manuscript.
+_active_window_eta = ((4.0 * math.sqrt(3.0) - 3.0) / 13.0) * (_lambda_eea ** 2)
+ACTIVE_WINDOW_DELTA = -math.log(_active_window_eta) / math.log(_lambda_eea)
 
 def paper_len_width(n: int) -> int:
     """Width of l_t, l_q and l_r' with the unary/sign-free endpoint unitary.
@@ -503,6 +510,76 @@ def dec_mod2n_1ctrl(qc: QuantumCircuit, ctrl: Qubit, reg: Sequence[Qubit], anc: 
     qc.cx(ctrl, reg[0])
 
 
+def _toggle_eq_const_under_ctrl_generic(
+    qc: QuantumCircuit,
+    reg: Sequence[Qubit],
+    value: int,
+    ctrl: Qubit,
+    flag: Qubit,
+    eq: Qubit,
+    pool: Sequence[Qubit],
+) -> None:
+    """flag ^= ctrl & [reg == value], restoring ``eq`` and ``reg``."""
+    compute_eq_const(qc, reg, value, eq, pool)
+    qc.ccx(ctrl, eq, flag)
+    compute_eq_const(qc, reg, value, eq, pool)
+
+
+def inc_offset_mod_m_1ctrl(
+    qc: QuantumCircuit,
+    ctrl: Qubit,
+    reg: Sequence[Qubit],
+    modulus: int,
+    scratch: Sequence[Qubit],
+) -> None:
+    """Increment a truth-minus-one circular pointer modulo ``modulus``.
+
+    Encoded zero is the all-ones word, while positive pointer ``j`` is encoded
+    as ``j-1``.  This keeps the paper's 9-bit ``ell_s`` register sufficient for
+    the 259-lane Work2 register at n=256, including terminal padding.
+    """
+    reg = list(reg); scratch = list(scratch)
+    w = len(reg); mask = (1 << w) - 1
+    if not (1 <= modulus <= mask):
+        raise ValueError(f"modulus {modulus} is not representable by {w}-bit truth-minus-one pointer")
+    if len(scratch) < max(w - 1, w):
+        raise ValueError("insufficient scratch for circular pointer increment")
+    inc_mod2n_1ctrl(qc, ctrl, reg, scratch[:max(0, w - 1)])
+    wrap, eq = scratch[0], scratch[1]
+    pool = scratch[2:]
+    _toggle_eq_const_under_ctrl_generic(qc, reg, modulus - 1, ctrl, wrap, eq, pool)
+    delta = (modulus - 1) ^ mask
+    for i, q in enumerate(reg):
+        if (delta >> i) & 1:
+            qc.cx(wrap, q)
+    _toggle_eq_const_under_ctrl_generic(qc, reg, mask, ctrl, wrap, eq, pool)
+
+
+def dec_offset_mod_m_1ctrl(
+    qc: QuantumCircuit,
+    ctrl: Qubit,
+    reg: Sequence[Qubit],
+    modulus: int,
+    scratch: Sequence[Qubit],
+) -> None:
+    """Inverse of :func:`inc_offset_mod_m_1ctrl`."""
+    reg = list(reg); scratch = list(scratch)
+    w = len(reg); mask = (1 << w) - 1
+    if not (1 <= modulus <= mask):
+        raise ValueError(f"modulus {modulus} is not representable by {w}-bit truth-minus-one pointer")
+    if len(scratch) < max(w - 1, w):
+        raise ValueError("insufficient scratch for circular pointer decrement")
+    dec_mod2n_1ctrl(qc, ctrl, reg, scratch[:max(0, w - 1)])
+    wrap, eq = scratch[0], scratch[1]
+    pool = scratch[2:]
+    _toggle_eq_const_under_ctrl_generic(qc, reg, mask - 1, ctrl, wrap, eq, pool)
+    delta = (mask - 1) ^ (modulus - 2)
+    for i, q in enumerate(reg):
+        if (delta >> i) & 1:
+            qc.cx(wrap, q)
+    _toggle_eq_const_under_ctrl_generic(qc, reg, modulus - 2, ctrl, wrap, eq, pool)
+
+
 def mcx_vchain(qc: QuantumCircuit, ctrls: Sequence[Qubit], target: Qubit, ancillas: Sequence[Qubit]) -> None:
     """Multi-controlled X using a clean v-chain.  All ancillas are restored."""
     ctrls = list(ctrls)
@@ -579,6 +656,29 @@ def controlled_rotate_right_by_two(qc: QuantumCircuit, ctrl: Qubit, reg: Sequenc
         pivot = cycle[0]
         for j in cycle[1:]:
             cswap_toffoli(qc, ctrl, r[pivot], r[j])
+
+
+def controlled_rotate_left_by_two(qc: QuantumCircuit, ctrl: Qubit, reg: Sequence[Qubit]) -> None:
+    """Literal inverse of :func:`controlled_rotate_right_by_two`."""
+    r = list(reg)
+    m = len(r)
+    if m <= 2:
+        return
+    seen = [False] * m
+    for start in range(m):
+        if seen[start]:
+            continue
+        cycle: list[int] = []
+        j = start
+        while not seen[j]:
+            seen[j] = True
+            cycle.append(j)
+            j = (j + 2) % m
+        if len(cycle) <= 1:
+            continue
+        # Reverse the transposition order used by the right rotation.
+        for i in range(len(cycle) - 1, 0, -1):
+            cswap_toffoli(qc, ctrl, r[cycle[0]], r[cycle[i]])
 
 
 def const_minus_inplace(qc: QuantumCircuit, reg: Sequence[Qubit], const: int, scratch: Sequence[Qubit]) -> None:
@@ -874,37 +974,39 @@ def _controlled_toffoli(qc: QuantumCircuit, ctrl: Qubit, a: Qubit, b: Qubit, tar
     mcx_vchain(qc, [ctrl, a, b], target, pool)
 
 
-def controlled_maj(qc: QuantumCircuit, ctrl: Qubit, a: Qubit, b: Qubit, c: Qubit, pool: Sequence[Qubit]) -> None:
-    """Paper Fig. 11 controlled MAJ cell.
+def controlled_maj(qc: QuantumCircuit, ctrl: Qubit, addend: Qubit, target: Qubit, carry: Qubit, pool: Sequence[Qubit]) -> None:
+    """Figure 11 controlled MAJ cell.
 
-    The location-control bit is applied only to the Toffoli gate that
-    updates the carry/next-carry line.  The two CNOTs remain ordinary
-    CNOTs, matching Section 4.3 of the PDF construction.
+    The CNOT skeleton is deliberately left uncontrolled.  Only the carry
+    update is location-controlled; matched MAJ/UMA passes cancel the skeleton
+    outside the selected interval.
     """
-    qc.cx(a, b)
-    qc.cx(a, c)
-    _controlled_toffoli(qc, ctrl, c, b, a, pool)
+    qc.cx(carry, target)
+    qc.cx(carry, addend)
+    _controlled_toffoli(qc, ctrl, target, addend, carry, pool)
 
 
-def controlled_uma(qc: QuantumCircuit, ctrl: Qubit, a: Qubit, b: Qubit, c: Qubit, pool: Sequence[Qubit]) -> None:
-    """Paper Fig. 11 controlled UMA cell."""
-    _controlled_toffoli(qc, ctrl, c, b, a, pool)
-    qc.cx(a, c)
-    qc.cx(c, b)
+def controlled_uma(qc: QuantumCircuit, ctrl: Qubit, addend: Qubit, target: Qubit, carry: Qubit, pool: Sequence[Qubit]) -> None:
+    """Figure 11 controlled UMA cell, including controlled sum writing."""
+    _controlled_toffoli(qc, ctrl, target, addend, carry, pool)
+    qc.ccx(ctrl, addend, target)
+    qc.cx(carry, addend)
+    qc.cx(carry, target)
 
 
-def controlled_maj_inv(qc: QuantumCircuit, ctrl: Qubit, a: Qubit, b: Qubit, c: Qubit, pool: Sequence[Qubit]) -> None:
-    """Inverse of the paper Fig. 11 controlled MAJ cell."""
-    _controlled_toffoli(qc, ctrl, c, b, a, pool)
-    qc.cx(a, c)
-    qc.cx(a, b)
+def controlled_maj_inv(qc: QuantumCircuit, ctrl: Qubit, addend: Qubit, target: Qubit, carry: Qubit, pool: Sequence[Qubit]) -> None:
+    """Literal inverse of :func:`controlled_maj`."""
+    _controlled_toffoli(qc, ctrl, target, addend, carry, pool)
+    qc.cx(carry, addend)
+    qc.cx(carry, target)
 
 
-def controlled_uma_inv(qc: QuantumCircuit, ctrl: Qubit, a: Qubit, b: Qubit, c: Qubit, pool: Sequence[Qubit]) -> None:
-    """Inverse of the paper Fig. 11 controlled UMA cell."""
-    qc.cx(c, b)
-    qc.cx(a, c)
-    _controlled_toffoli(qc, ctrl, c, b, a, pool)
+def controlled_uma_inv(qc: QuantumCircuit, ctrl: Qubit, addend: Qubit, target: Qubit, carry: Qubit, pool: Sequence[Qubit]) -> None:
+    """Literal inverse of :func:`controlled_uma`."""
+    qc.cx(carry, target)
+    qc.cx(carry, addend)
+    qc.ccx(ctrl, addend, target)
+    _controlled_toffoli(qc, ctrl, target, addend, carry, pool)
 
 
 def _apply_cell(
@@ -938,32 +1040,44 @@ def pre_shift_gate(*, work_size: int, shift_width: int, name: str = "PRE_SHIFT_N
     l_s = QuantumRegister(shift_width, "l_s")
     Scratch = QuantumRegister(shift_width + 4, "Scratch")
     qc = _block_circuit(Phase1, Phase2, Work2, l_s, Scratch, name=name)
-
     phase1_is0 = Scratch[0]
     both = Scratch[1]
-    chain = list(Scratch[2:2 + max(0, shift_width - 1)])
+    ptr_scratch = list(Scratch[2:]) + [Scratch[0], Scratch[1]]
 
-    qc.x(Phase1[0])
-    qc.cx(Phase1[0], phase1_is0)
-    qc.x(Phase1[0])
-
-    # one-position left shift of Work2 controlled by Phase1=0
+    qc.x(Phase1[0]); qc.cx(Phase1[0], phase1_is0); qc.x(Phase1[0])
     for i in range(work_size - 1):
         cswap_toffoli(qc, phase1_is0, Work2[i], Work2[i + 1])
-    inc_mod2n_1ctrl(qc, phase1_is0, list(l_s), chain)
+    inc_offset_mod_m_1ctrl(qc, phase1_is0, list(l_s), work_size, ptr_scratch)
 
-    # if Phase2=1, additionally right-shift by two and l_s -= 2.
-    # The two-position shift is implemented as one controlled permutation
-    # using cycle decomposition, not as two adjacent one-position shifts.
     qc.ccx(phase1_is0, Phase2[0], both)
     controlled_rotate_right_by_two(qc, both, list(Work2))
-    dec_mod2n_1ctrl(qc, both, list(l_s), chain)
-    dec_mod2n_1ctrl(qc, both, list(l_s), chain)
+    dec_offset_mod_m_1ctrl(qc, both, list(l_s), work_size, ptr_scratch)
+    dec_offset_mod_m_1ctrl(qc, both, list(l_s), work_size, ptr_scratch)
     qc.ccx(phase1_is0, Phase2[0], both)
+    qc.x(Phase1[0]); qc.cx(Phase1[0], phase1_is0); qc.x(Phase1[0])
+    return _finalize_block(qc)
 
-    qc.x(Phase1[0])
-    qc.cx(Phase1[0], phase1_is0)
-    qc.x(Phase1[0])
+
+@lru_cache(maxsize=None)
+def pre_shift_inverse_gate(*, work_size: int, shift_width: int, name: str = "PRE_SHIFT_INV") -> Gate:
+    Phase1 = QuantumRegister(1, "Phase1")
+    Phase2 = QuantumRegister(1, "Phase2")
+    Work2 = QuantumRegister(work_size, "Work2")
+    l_s = QuantumRegister(shift_width, "l_s")
+    Scratch = QuantumRegister(shift_width + 4, "Scratch")
+    qc = _block_circuit(Phase1, Phase2, Work2, l_s, Scratch, name=name)
+    phase1_is0 = Scratch[0]; both = Scratch[1]
+    ptr_scratch = list(Scratch[2:]) + [Scratch[0], Scratch[1]]
+    qc.x(Phase1[0]); qc.cx(Phase1[0], phase1_is0); qc.x(Phase1[0])
+    qc.ccx(phase1_is0, Phase2[0], both)
+    inc_offset_mod_m_1ctrl(qc, both, list(l_s), work_size, ptr_scratch)
+    inc_offset_mod_m_1ctrl(qc, both, list(l_s), work_size, ptr_scratch)
+    controlled_rotate_left_by_two(qc, both, list(Work2))
+    qc.ccx(phase1_is0, Phase2[0], both)
+    dec_offset_mod_m_1ctrl(qc, phase1_is0, list(l_s), work_size, ptr_scratch)
+    for i in reversed(range(work_size - 1)):
+        cswap_toffoli(qc, phase1_is0, Work2[i], Work2[i + 1])
+    qc.x(Phase1[0]); qc.cx(Phase1[0], phase1_is0); qc.x(Phase1[0])
     return _finalize_block(qc)
 
 
@@ -975,19 +1089,37 @@ def post_shift_gate(*, work_size: int, shift_width: int, name: str = "POST_SHIFT
     l_s = QuantumRegister(shift_width, "l_s")
     Scratch = QuantumRegister(shift_width + 4, "Scratch")
     qc = _block_circuit(Phase1, Phase2, Work2, l_s, Scratch, name=name)
-
     both = Scratch[0]
-    chain = list(Scratch[1:1 + max(0, shift_width - 1)])
-
+    ptr_scratch = list(Scratch[1:]) + [Scratch[0]]
     for i in range(work_size - 1):
         cswap_toffoli(qc, Phase1[0], Work2[i], Work2[i + 1])
-    inc_mod2n_1ctrl(qc, Phase1[0], list(l_s), chain)
-
+    inc_offset_mod_m_1ctrl(qc, Phase1[0], list(l_s), work_size, ptr_scratch)
     qc.ccx(Phase1[0], Phase2[0], both)
     controlled_rotate_right_by_two(qc, both, list(Work2))
-    dec_mod2n_1ctrl(qc, both, list(l_s), chain)
-    dec_mod2n_1ctrl(qc, both, list(l_s), chain)
+    dec_offset_mod_m_1ctrl(qc, both, list(l_s), work_size, ptr_scratch)
+    dec_offset_mod_m_1ctrl(qc, both, list(l_s), work_size, ptr_scratch)
     qc.ccx(Phase1[0], Phase2[0], both)
+    return _finalize_block(qc)
+
+
+@lru_cache(maxsize=None)
+def post_shift_inverse_gate(*, work_size: int, shift_width: int, name: str = "POST_SHIFT_INV") -> Gate:
+    Phase1 = QuantumRegister(1, "Phase1")
+    Phase2 = QuantumRegister(1, "Phase2")
+    Work2 = QuantumRegister(work_size, "Work2")
+    l_s = QuantumRegister(shift_width, "l_s")
+    Scratch = QuantumRegister(shift_width + 4, "Scratch")
+    qc = _block_circuit(Phase1, Phase2, Work2, l_s, Scratch, name=name)
+    both = Scratch[0]
+    ptr_scratch = list(Scratch[1:]) + [Scratch[0]]
+    qc.ccx(Phase1[0], Phase2[0], both)
+    inc_offset_mod_m_1ctrl(qc, both, list(l_s), work_size, ptr_scratch)
+    inc_offset_mod_m_1ctrl(qc, both, list(l_s), work_size, ptr_scratch)
+    controlled_rotate_left_by_two(qc, both, list(Work2))
+    qc.ccx(Phase1[0], Phase2[0], both)
+    dec_offset_mod_m_1ctrl(qc, Phase1[0], list(l_s), work_size, ptr_scratch)
+    for i in reversed(range(work_size - 1)):
+        cswap_toffoli(qc, Phase1[0], Work2[i], Work2[i + 1])
     return _finalize_block(qc)
 
 
@@ -1056,6 +1188,36 @@ def phase_update_gate(*, len_width: int, shift_width: int, name: str = "PHASE_UP
     return _finalize_block(qc)
 
 
+@lru_cache(maxsize=None)
+def phase_update_inverse_gate(*, len_width: int, shift_width: int, name: str = "PHASE_UPDATE_INV") -> Gate:
+    """Literal inverse of :func:`phase_update_gate`."""
+    Phase1 = QuantumRegister(1, "Phase1")
+    Phase2 = QuantumRegister(1, "Phase2")
+    Sign = QuantumRegister(1, "Sign")
+    l_q = QuantumRegister(len_width, "l_q")
+    l_rp = QuantumRegister(len_width, "l_rp")
+    l_s = QuantumRegister(shift_width, "l_s")
+    eq_scratch = max(0, max(len_width, shift_width) - 2)
+    Scratch = QuantumRegister(5 + eq_scratch, "Scratch")
+    qc = _block_circuit(Phase1, Phase2, Sign, l_q, l_rp, l_s, Scratch, name=name)
+    z_lq,z_lrp,z_ls,cond,tmp=Scratch[0],Scratch[1],Scratch[2],Scratch[3],Scratch[4]
+    pool=list(Scratch[5:])
+    def toggle_zero(reg, flag): mcx_vchain(qc, list(reg), flag, pool)
+    toggle_zero(l_q,z_lq); toggle_zero(l_rp,z_lrp); toggle_zero(l_s,z_ls)
+    # Undo the ell_s=0 phase flips first.
+    qc.cx(z_ls, Phase2[0]); qc.cx(z_ls, Phase1[0])
+    qc.x(z_lrp); qc.ccx(z_lq,z_lrp,cond); qc.x(z_lrp)
+    # Undo Sign using the current (post-forward-update) Phase2.
+    qc.ccx(cond, Phase2[0], Sign[0])
+    # Sign and Phase1 are now their pre-forward values, so rebuild the same tmp.
+    qc.cx(Sign[0],tmp); qc.cx(Phase1[0],tmp)
+    qc.ccx(cond,tmp,Phase2[0])
+    qc.cx(Phase1[0],tmp); qc.cx(Sign[0],tmp)
+    qc.x(z_lrp); qc.ccx(z_lq,z_lrp,cond); qc.x(z_lrp)
+    toggle_zero(l_s,z_ls); toggle_zero(l_rp,z_lrp); toggle_zero(l_q,z_lq)
+    return _finalize_block(qc)
+
+
 # Location-controlled Swap / Add / Sub using unary iteration
 @lru_cache(maxsize=None)
 def lc_swap_unary_gate(*, k: int, K: int, len_width: int, name: str = "LC_SWAP_UNARY") -> Gate:
@@ -1095,175 +1257,82 @@ def lc_swap_unary_gate(*, k: int, K: int, len_width: int, name: str = "LC_SWAP_U
 
 @lru_cache(maxsize=None)
 def lc_interval_addsub_unary_gate(
-    *,
-    n: int,
-    k: int,
-    K: int,
-    len_width: int,
-    shift_width: int,
-    mode: Literal["add", "sub"],
-    sign_update: bool,
-    target: Literal["work1", "work2"],
-    name: str,
+    *, n: int, k: int, K: int, len_width: int, shift_width: int,
+    mode: Literal["add", "sub"], sign_update: bool,
+    target: Literal["work1", "work2"], name: str,
+    guard_lrp_width: int = 0,
 ) -> Gate:
-    """Two-endpoint interval Add/Sub for r-side arithmetic.
-
-    Endpoints are prepared exactly as PDF Eq. (13), with the Section-4.2
-    truth-minus-one encoding:
-        L = ell_t + ell_q + 2 -> l_q <- l_q + l_t + 4,
-        R = n + 3 - ell_s     -> l_s <- n + 2 - l_s.
-    The dual unary scan exposes r_j = Ctrl[R=j] and lambda_j = Ctrl[L=j].
-    """
-    if k > K:
-        raise ValueError("need k <= K")
-    M = K - k + 1
-    depth = unary_depth(M)
-    endpoint_width = max(len_width, shift_width)
-    scratch_size = (endpoint_width + 2) + 2 * depth + 5
-
-    Ctrl = QuantumRegister(1, "Ctrl")
-    Sign = QuantumRegister(1, "Sign")
-    Work1 = QuantumRegister(M, "Work1")
-    Work2 = QuantumRegister(M, "Work2")
-    l_t = QuantumRegister(len_width, "l_t")
-    l_q = QuantumRegister(len_width, "l_q")
-    l_s = QuantumRegister(shift_width, "l_s")
-    Scratch = QuantumRegister(scratch_size, "Scratch")
-    qc = _block_circuit(Ctrl, Sign, Work1, Work2, l_t, l_q, l_s, Scratch, name=name)
-
-    carry = Scratch[0]
-    z = Scratch[1]
-    acc = Scratch[2]
-    const_scratch = list(Scratch[: endpoint_width + 2])
-    anc_a = list(Scratch[endpoint_width + 2: endpoint_width + 2 + depth])
-    anc_b = list(Scratch[endpoint_width + 2 + depth: endpoint_width + 2 + 2 * depth])
-    pool = list(Scratch[endpoint_width + 2 + 2 * depth:])
-    if len(pool) < 1:
-        raise ValueError("internal pool too small")
-
-    # Prepare raw L=(ell_t-1)+(ell_q-1)+4 and raw R=n+2-(ell_s-1).
-    qc.append(cuccaro_add_mod_2n_no_z_gate(len_width, name="ADD_lt_to_lq"), list(l_t) + list(l_q) + [carry])
-    add_const_mod_2n(qc, l_q, 4, const_scratch)
-    const_minus_inplace(qc, l_s, n + 2, const_scratch)
-
-    def qpair(j: int) -> tuple[Qubit, Qubit]:
-        idx = j - k
-        if target == "work1":
-            addend = Work2[idx]
-            tgt = Work1[idx]
-        elif target == "work2":
-            addend = Work1[idx]
-            tgt = Work2[idx]
-        else:
-            raise ValueError("target must be 'work1' or 'work2'")
-        return addend, tgt
-
-    # First pass: j = K, K-1, ..., k.  Toggle at R before the cell and at L after.
-    def leaf_first(j: int, rj: Qubit, lj: Qubit) -> None:
-        addend, tgt = qpair(j)
-        qc.cx(rj, acc)
-        _apply_cell(qc, mode, "first", acc, addend, tgt, carry, pool)
-        qc.cx(lj, acc)
-
-    dual_unary_iteration(qc, index_a=l_s, index_b=l_q, labels=list(range(k, K + 1)),
-                         ctrl_a=Ctrl[0], ctrl_b=Ctrl[0], ancillas_a=anc_a,
-                         ancillas_b=anc_b, leaf_fn=leaf_first, order="dec")
-
+    """Endpoint-complete interval arithmetic for the general implementation."""
+    if k > K: raise ValueError("need k <= K")
+    M=K-k+1; depth=unary_depth(M); endpoint_width=max(len_width,shift_width)
+    scratch_size=max((endpoint_width+2)+2*depth+5, max(0,guard_lrp_width-1)+3)
+    Ctrl=QuantumRegister(1,"Ctrl"); Sign=QuantumRegister(1,"Sign")
+    Work1=QuantumRegister(M,"Work1"); Work2=QuantumRegister(M,"Work2")
+    l_t=QuantumRegister(len_width,"l_t"); l_q=QuantumRegister(len_width,"l_q"); l_s=QuantumRegister(shift_width,"l_s")
+    l_rp_guard=QuantumRegister(guard_lrp_width,"l_rp_guard") if guard_lrp_width else None
+    Scratch=QuantumRegister(scratch_size,"Scratch")
+    regs=[Ctrl,Sign,Work1,Work2,l_t,l_q,l_s]
+    if l_rp_guard is not None: regs.append(l_rp_guard)
+    regs.append(Scratch); qc=_block_circuit(*regs,name=name)
+    carry=Scratch[0]; acc=Scratch[2]
+    const_scratch=list(Scratch[:endpoint_width+2])
+    anc_a=list(Scratch[endpoint_width+2:endpoint_width+2+depth])
+    anc_b=list(Scratch[endpoint_width+2+depth:endpoint_width+2+2*depth])
+    pool=list(Scratch[endpoint_width+2+2*depth:])
+    qc.append(cuccaro_add_mod_2n_no_z_gate(len_width,name="ADD_lt_to_lq"),list(l_t)+list(l_q)+[carry])
+    add_const_mod_2n(qc,l_q,4,const_scratch); const_minus_inplace(qc,l_s,n+2,const_scratch)
+    def qpair(j):
+        idx=j-k
+        if target=="work1": return Work2[idx],Work1[idx]
+        if target=="work2": return Work1[idx],Work2[idx]
+        raise ValueError("bad target")
+    def first(j,rj,lj):
+        a,t=qpair(j); qc.cx(rj,acc); _apply_cell(qc,mode,"first",acc,a,t,carry,pool); qc.cx(lj,acc)
+    dual_unary_iteration(qc,index_a=l_s,index_b=l_q,labels=list(range(k,K+1)),ctrl_a=Ctrl[0],ctrl_b=Ctrl[0],
+                         ancillas_a=anc_a,ancillas_b=anc_b,leaf_fn=first,order="dec")
     if sign_update:
-        qc.cx(carry, Sign[0])
-
-    # Second pass: j = k, k+1, ..., K.  Toggle at L before and at R after.
-    def leaf_second(j: int, rj: Qubit, lj: Qubit) -> None:
-        addend, tgt = qpair(j)
-        qc.cx(lj, acc)
-        _apply_cell(qc, mode, "second", acc, addend, tgt, carry, pool)
-        qc.cx(rj, acc)
-
-    dual_unary_iteration(qc, index_a=l_s, index_b=l_q, labels=list(range(k, K + 1)),
-                         ctrl_a=Ctrl[0], ctrl_b=Ctrl[0], ancillas_a=anc_a,
-                         ancillas_b=anc_b, leaf_fn=leaf_second, order="inc")
-
-    # Restore endpoint registers.
-    const_minus_inplace(qc, l_s, n + 2, const_scratch)
-    sub_const_mod_2n(qc, l_q, 4, const_scratch)
-    qc.append(cuccaro_sub_mod_2n_no_z_gate(len_width, name="SUB_lt_from_lq"), list(l_t) + list(l_q) + [carry])
+        qc.cx(carry,Sign[0])
+        if l_rp_guard is not None:
+            mcx_vchain(qc,[carry]+list(l_rp_guard),Sign[0],list(Scratch))
+    def second(j,rj,lj):
+        a,t=qpair(j); qc.cx(lj,acc); _apply_cell(qc,mode,"second",acc,a,t,carry,pool); qc.cx(rj,acc)
+    dual_unary_iteration(qc,index_a=l_s,index_b=l_q,labels=list(range(k,K+1)),ctrl_a=Ctrl[0],ctrl_b=Ctrl[0],
+                         ancillas_a=anc_a,ancillas_b=anc_b,leaf_fn=second,order="inc")
+    const_minus_inplace(qc,l_s,n+2,const_scratch); sub_const_mod_2n(qc,l_q,4,const_scratch)
+    qc.append(cuccaro_sub_mod_2n_no_z_gate(len_width,name="SUB_lt_from_lq"),list(l_t)+list(l_q)+[carry])
     return _finalize_block(qc)
 
 
 @lru_cache(maxsize=None)
 def lc_prefix_addsub_unary_gate(
-    *,
-    k: int,
-    K: int,
-    len_width: int,
-    mode: Literal["add", "sub"],
-    sign_update: bool,
-    target: Literal["work1", "work2"],
-    name: str,
+    *, k: int, K: int, len_width: int,
+    mode: Literal["add", "sub"], sign_update: bool,
+    target: Literal["work1", "work2"], name: str,
 ) -> Gate:
-    """One-sided Add/Sub for t-side arithmetic over k..R, R=ell_t+1.
-
-    With encoded l_t=ell_t-1, the endpoint register is prepared by l_t += 2.
-    """
-    if k > K:
-        raise ValueError("need k <= K")
-    M = K - k + 1
-    depth = unary_depth(M)
-    scratch_size = (len_width + 2) + depth + 4
-
-    Ctrl = QuantumRegister(1, "Ctrl")
-    Sign = QuantumRegister(1, "Sign")
-    Work1 = QuantumRegister(M, "Work1")
-    Work2 = QuantumRegister(M, "Work2")
-    l_t = QuantumRegister(len_width, "l_t")
-    Scratch = QuantumRegister(scratch_size, "Scratch")
-    qc = _block_circuit(Ctrl, Sign, Work1, Work2, l_t, Scratch, name=name)
-
-    carry = Scratch[0]
-    acc = Scratch[1]
-    const_scratch = list(Scratch[: len_width + 2])
-    path = list(Scratch[len_width + 2: len_width + 2 + depth])
-    pool = list(Scratch[len_width + 2 + depth:])
-    if len(pool) < 1:
-        raise ValueError("internal pool too small")
-
-    # l_t temporarily stores raw R=ell_t+1=(ell_t-1)+2.
-    add_const_mod_2n(qc, l_t, 2, const_scratch)
-
-    def qpair(j: int) -> tuple[Qubit, Qubit]:
-        idx = j - k
-        if target == "work1":
-            return Work2[idx], Work1[idx]
-        if target == "work2":
-            return Work1[idx], Work2[idx]
-        raise ValueError("target must be 'work1' or 'work2'")
-
-    # First pass: decreasing.  acc is turned on at R and reset at k after the cell.
-    def leaf_first(j: int, ej: Qubit) -> None:
-        addend, tgt = qpair(j)
-        qc.cx(ej, acc)
-        _apply_cell(qc, mode, "first", acc, addend, tgt, carry, pool)
-        if j == k:
-            qc.cx(Ctrl[0], acc)
-
-    unary_iteration(qc, index_reg=l_t, labels=list(range(k, K + 1)), ctrl=Ctrl[0],
-                    ancillas=path, leaf_fn=leaf_first, order="dec")
-
-    if sign_update:
-        qc.cx(carry, Sign[0])
-
-    # Second pass: increasing.  acc starts on and is turned off after R.
-    qc.cx(Ctrl[0], acc)
-
-    def leaf_second(j: int, ej: Qubit) -> None:
-        addend, tgt = qpair(j)
-        _apply_cell(qc, mode, "second", acc, addend, tgt, carry, pool)
-        qc.cx(ej, acc)
-
-    unary_iteration(qc, index_reg=l_t, labels=list(range(k, K + 1)), ctrl=Ctrl[0],
-                    ancillas=path, leaf_fn=leaf_second, order="inc")
-
-    sub_const_mod_2n(qc, l_t, 2, const_scratch)
+    """Little-endian t-side prefix arithmetic."""
+    if k>K: raise ValueError("need k <= K")
+    M=K-k+1; depth=unary_depth(M); scratch_size=(len_width+2)+depth+4
+    Ctrl=QuantumRegister(1,"Ctrl"); Sign=QuantumRegister(1,"Sign")
+    Work1=QuantumRegister(M,"Work1"); Work2=QuantumRegister(M,"Work2"); l_t=QuantumRegister(len_width,"l_t")
+    Scratch=QuantumRegister(scratch_size,"Scratch"); qc=_block_circuit(Ctrl,Sign,Work1,Work2,l_t,Scratch,name=name)
+    carry=Scratch[0]; acc=Scratch[1]; const_scratch=list(Scratch[:len_width+2])
+    path=list(Scratch[len_width+2:len_width+2+depth]); pool=list(Scratch[len_width+2+depth:])
+    add_const_mod_2n(qc,l_t,2,const_scratch)
+    def qpair(j):
+        idx=j-k
+        if target=="work1": return Work2[idx],Work1[idx]
+        if target=="work2": return Work1[idx],Work2[idx]
+        raise ValueError("bad target")
+    qc.cx(Ctrl[0],acc)
+    def first(j,ej):
+        a,t=qpair(j); _apply_cell(qc,mode,"first",acc,a,t,carry,pool); qc.cx(ej,acc)
+    unary_iteration(qc,index_reg=l_t,labels=list(range(k,K+1)),ctrl=Ctrl[0],ancillas=path,leaf_fn=first,order="inc")
+    if sign_update: qc.cx(carry,Sign[0])
+    def second(j,ej):
+        a,t=qpair(j); qc.cx(ej,acc); _apply_cell(qc,mode,"second",acc,a,t,carry,pool)
+        if j==k: qc.cx(Ctrl[0],acc)
+    unary_iteration(qc,index_reg=l_t,labels=list(range(k,K+1)),ctrl=Ctrl[0],ancillas=path,leaf_fn=second,order="dec")
+    sub_const_mod_2n(qc,l_t,2,const_scratch)
     return _finalize_block(qc)
 
 
@@ -1601,27 +1670,28 @@ def Nmax_steps(n: int) -> int:
 
 
 def active_windows(n: int, T: int) -> dict[str, tuple[int, int]]:  # type: ignore[override]
-    """Step-dependent active windows, verbatim Section 4.5 formulas.
+    """Revised-paper Appendix A.2 active windows.
 
-    No defensive clipping is applied here: if a caller asks for a step outside
-    the paper's valid range, invalid windows are reported as errors by the
-    Qiskit builder instead of being silently changed.
+    The implementation intentionally follows the supplied manuscript formulas
+    exactly, including the delta improvement, rather than widening the windows.
     """
-    if T < 1:
-        raise ValueError("Algorithm-3 step index T is 1-based; need T >= 1")
+    if n <= 0 or T <= 0:
+        raise ValueError("n and T must be positive")
     c = C_EEA
-    k1 = max(_ceil_safe((T - (n + 2)) / (4.0 * c - 1.0)), 1) + 2
+    delta = ACTIVE_WINDOW_DELTA
+
+    k1 = max(_ceil_safe((T - n - 1 - 4.0 * delta) / (4.0 * c - 1.0)), 1) + 2
     K1 = n + 3
 
-    k2 = max(_ceil_safe((T - 3.0 * (n + 2)) / (4.0 * c - 3.0)), 1) + 1
+    k2 = max(_ceil_safe((T - 3.0 * (n + 1) - 4.0 * delta) / (4.0 * c - 3.0)), 1) + 1
     K2 = min(_floor_safe(T / 2.0) + 2, n + 2)
 
     K3 = min(_ceil_safe(T / 4.0) + 1, n + 1)
 
-    k4 = max(_ceil_safe((T - 4.0 * (n + 2)) / (4.0 * c - 4.0)), 1)
+    k4 = max(_ceil_safe((T - 4.0 * (n + 1) - 4.0 * delta) / (4.0 * c - 4.0)), 1)
     K4 = min(_floor_safe(T / 4.0 + 3.0), n + 3)
 
-    k5 = _ceil_safe(T / (4.0 * c))
+    k5 = max(_ceil_safe((T - 4.0 * delta) / (4.0 * c)), 1)
     K5 = min(_floor_safe(T / 4.0 + 4.0), n + 3)
 
     out = {
@@ -1810,10 +1880,11 @@ def append_one_step_T(  # type: ignore[override]
     # R-side subtraction: controlled by Phase1=0.
     _make_condition_into(qc, [(Phase1[0], 0)], ctrl, pool)
     rsub = lc_interval_addsub_unary_gate(n=n, k=k1, K=K1, len_width=len_width, shift_width=shift_width,
-                                         mode="sub", sign_update=True, target="work1", name="R_SUB_UNARY")
+                                         mode="sub", sign_update=True, target="work1", name="R_SUB_UNARY",
+                                         guard_lrp_width=len_width)
     _append_with_shared_aux(qc, rsub,
                             [ctrl, Sign[0]] + list(Work1[k1 - 1:K1]) + list(Work2[k1 - 1:K1])
-                            + list(l_t) + list(l_q) + list(l_s), Aux)
+                            + list(l_t) + list(l_q) + list(l_s) + list(l_rp), Aux)
     _make_condition_into(qc, [(Phase1[0], 0)], ctrl, pool)
 
     # Algorithm 3: if Phase1=0 and Phase2=1 then Sign ^= 1.
@@ -1832,6 +1903,13 @@ def append_one_step_T(  # type: ignore[override]
     _make_condition_into(qc, [(Phase1[0], 0), (tmp, 0)], ctrl, pool)
     qc.ccx(Phase2[0], Sign[0], tmp)
 
+    # In Phase 2 the quotient length is incremented before selecting the newly
+    # created least-significant q lane.  In Phase 3 it is decremented only after
+    # the selected quotient bit has been consumed.
+    _make_condition_into(qc, [(Phase1[0], 0), (Phase2[0], 1)], ctrl, pool)
+    inc_mod2n_1ctrl(qc, ctrl, list(l_q), list(Aux[: max(0, len_width - 1)]))
+    _make_condition_into(qc, [(Phase1[0], 0), (Phase2[0], 1)], ctrl, pool)
+
     # Location-controlled Swap: controlled by Phase1 xor Phase2.
     qc.cx(Phase1[0], ctrl)
     qc.cx(Phase2[0], ctrl)
@@ -1841,14 +1919,9 @@ def append_one_step_T(  # type: ignore[override]
     qc.cx(Phase2[0], ctrl)
     qc.cx(Phase1[0], ctrl)
 
-    # l_q update inside the same Phase1 xor Phase2 branch.
     _make_condition_into(qc, [(Phase1[0], 1), (Phase2[0], 0)], ctrl, pool)
     dec_mod2n_1ctrl(qc, ctrl, list(l_q), list(Aux[: max(0, len_width - 1)]))
     _make_condition_into(qc, [(Phase1[0], 1), (Phase2[0], 0)], ctrl, pool)
-
-    _make_condition_into(qc, [(Phase1[0], 0), (Phase2[0], 1)], ctrl, pool)
-    inc_mod2n_1ctrl(qc, ctrl, list(l_q), list(Aux[: max(0, len_width - 1)]))
-    _make_condition_into(qc, [(Phase1[0], 0), (Phase2[0], 1)], ctrl, pool)
 
     # T-side subtraction: Phase1=1 and (Phase2=1 or Sign=0).
     _make_condition_into(qc, [(Phase2[0], 0), (Sign[0], 1)], tmp, pool)
@@ -2736,9 +2809,15 @@ def _iter_circuit_items(circ: QuantumCircuit):
 
 
 def count_instruction_ops(inst: Instruction) -> Counter:
-    if inst.name in PRIMITIVE_OPS:
-        return Counter({inst.name: 1})
-    if inst.name == "if_else" and hasattr(inst, "blocks"):
+    name = str(inst.name).lower()
+    # Qiskit canonicalizes self-inverse primitive daggers back to the primitive
+    # name.  Lightweight compatibility runtimes may retain an ``_dg`` suffix;
+    # normalize it here without treating it as an opaque operation.
+    if name.endswith("_dg") and name[:-3] in PRIMITIVE_OPS:
+        name = name[:-3]
+    if name in PRIMITIVE_OPS:
+        return Counter({name: 1})
+    if name == "if_else" and hasattr(inst, "blocks"):
         total = Counter()
         for block in inst.blocks:
             for subinst, _qargs, _cargs in _iter_circuit_items(block):
@@ -2778,11 +2857,15 @@ def count_pdf_formula_one_step(n: int, T: int) -> Counter:
     d4 = max(0, K4 - k4)
     d5 = max(0, K5 - k5)
 
-    ccx = 14 * d1 + 2 * d2 + 12 * d3
-    cx = 8 * d1 + 4 * d2 + 4 * d3
+    # Table 5 gives the cost of one block.  Algorithm 3 invokes two r-side
+    # blocks and two t-side blocks per step, plus one swap.  Each length-update
+    # block is present only when 4 divides T.  Shift and O(log n) endpoint
+    # arithmetic are intentionally outside this major-block formula.
+    ccx = 2 * 11 * d1 + 2 * d2 + 2 * 9 * d3
+    cx = 2 * 12 * d1 + 4 * d2 + 2 * 10 * d3
     if T % 4 == 0:
-        ccx += 12 * d4 + 12 * d5
-        cx += 16 * d4 + 16 * d5
+        ccx += 24 * d4 + 24 * d5
+        cx += 32 * d4 + 32 * d5
     return Counter({"ccx": ccx, "cx": cx})
 
 
@@ -2809,7 +2892,7 @@ def _count_full_steps_recursive_streaming(
 
     This is not the Section-5 paper formula.  Each step is built with
     ``append_one_step_T`` and recursively walked down to X/CX/CCX.  We stream the
-    steps instead of materializing the entire 1476-step top-level circuit, which
+    steps instead of materializing the entire fixed-schedule top-level circuit, which
     keeps n=256 counting tractable while producing the same raw recursive count
     as a full top-level circuit without cross-gate cancellation/optimization.
     """

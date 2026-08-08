@@ -14,7 +14,12 @@ def count_range(n:int,T_max:int,start:int,end:int,*,aux_size:int,measurement_unc
         total += eea.count_circuit_ops_recursive(qc)
         num_qubits=qc.num_qubits
         del qc
-        if T%25==0: gc.collect()
+        # Every step can have a distinct active-window definition.  Releasing
+        # those definitions immediately keeps n=256/n=512 counting bounded in
+        # memory; it does not change the accumulated primitive-gate counts.
+        eea.clear_gate_construction_caches()
+        if T % 25 == 0:
+            gc.collect()
     return {'mode':'eea-s835-fastdual-recursive-chunk','n':n,'T_max':T_max,'range':[start,end],
             'num_qubits':int(num_qubits or 0),'len_width':lw,'shift_width':sw,'aux_size':aux_size,
             'measurement_based':bool(measurement_uncompute),'ops':{k:int(v) for k,v in sorted(total.items())}}

@@ -196,7 +196,7 @@ def count_compiled_eea_shared(n: int, p: int, policy: CounterPolicy, eea_steps_j
     )
     g = eea_forward_shared_instruction(n, p)
     # The wrapped fastdual EEA step instructions are real definitions.  For n=256
-    # we avoid expanding the 1476 step bodies here and instead load the chunk
+    # we avoid expanding all fixed-schedule step bodies here and instead load the chunk
     # counts obtained by recursively counting the same step circuits.  The
     # counter stops on the step instruction name and records STOP:: entries.
     stop_policy = CounterPolicy(

@@ -389,7 +389,7 @@ def test_step_schedule_structure() -> None:
 
 
 def expected_active_windows(n: int, T: int) -> Dict[str, Tuple[int, int]]:
-    c = 1.0 / math.log2((math.sqrt(5.0) + 1.0) / 2.0)
+    c = 3.0 / math.log2(2.0 + math.sqrt(3.0))
     ceil = lambda x: math.ceil(x - 1e-12)
     floor = lambda x: math.floor(x + 1e-12)
     return {

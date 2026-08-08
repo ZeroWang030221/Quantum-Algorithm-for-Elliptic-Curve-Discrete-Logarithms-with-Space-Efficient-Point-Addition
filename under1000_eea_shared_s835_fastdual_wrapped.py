@@ -113,6 +113,64 @@ def _prepare_work2_from_little_endian_x(qc: QuantumCircuit, X: Sequence[Qubit], 
     return work2
 
 
+def _restore_little_endian_x_from_work2(qc: QuantumCircuit, X: Sequence[Qubit], tail: Sequence[Qubit]) -> None:
+    """Inverse of :func:`_prepare_work2_from_little_endian_x`."""
+    X=list(X); tail=list(tail); n=len(X); wires=X+tail
+    forward=[0]*(n+3)
+    for i in range(n): forward[i]=3+(n-1-i)
+    forward[n]=0; forward[n+1]=1; forward[n+2]=2
+    inverse=[0]*(n+3)
+    for source,target in enumerate(forward): inverse[target]=source
+    _apply_source_to_target_permutation(qc,wires,inverse)
+
+
+def _controlled_rotate_by_offset(qc: QuantumCircuit, ctrl: Qubit, reg: Sequence[Qubit], offset: int) -> None:
+    """Controlled cyclic right rotation by a fixed offset using paper cswaps."""
+    r=list(reg); m=len(r); offset%=m
+    if offset==0: return
+    import math
+    # Old value at position j moves to j+offset.  Use cycle transpositions.
+    seen=[False]*m
+    for start in range(m):
+        if seen[start]: continue
+        cycle=[]; j=start
+        while not seen[j]:
+            seen[j]=True; cycle.append(j); j=(j+offset)%m
+        for i in range(1,len(cycle)):
+            eea.cswap_toffoli(qc,ctrl,r[cycle[0]],r[cycle[i]])
+
+
+def _controlled_rotate_left_by_offset(qc: QuantumCircuit, ctrl: Qubit, reg: Sequence[Qubit], offset: int) -> None:
+    _controlled_rotate_by_offset(qc,ctrl,reg,-int(offset))
+
+
+def _canonical_unrotate_work2(qc: QuantumCircuit, Work2: Sequence[Qubit], l_s: Sequence[Qubit], scratch: Sequence[Qubit]) -> None:
+    """Convert the circular Work2 representation to canonical orientation."""
+    l_s=list(l_s); scratch=list(scratch)
+    eea.inc_mod2n_uncontrolled(qc,l_s,scratch[:max(0,len(l_s)-1)])
+    for bit,control in enumerate(l_s):
+        _controlled_rotate_by_offset(qc,control,Work2,1<<bit)
+    eea.dec_mod2n_uncontrolled(qc,l_s,scratch[:max(0,len(l_s)-1)])
+
+
+def _restore_terminal_rotation(qc: QuantumCircuit, Work2: Sequence[Qubit], l_s: Sequence[Qubit], scratch: Sequence[Qubit]) -> None:
+    """Inverse of :func:`_canonical_unrotate_work2`."""
+    l_s=list(l_s); scratch=list(scratch)
+    eea.inc_mod2n_uncontrolled(qc,l_s,scratch[:max(0,len(l_s)-1)])
+    for bit in reversed(range(len(l_s))):
+        _controlled_rotate_left_by_offset(qc,l_s[bit],Work2,1<<bit)
+    eea.dec_mod2n_uncontrolled(qc,l_s,scratch[:max(0,len(l_s)-1)])
+
+
+def _toggle_terminal_large_workspace(qc: QuantumCircuit, A: Sequence[Qubit], p: int) -> None:
+    """Toggle the input-independent terminal contents of the n-qubit A slice."""
+    A=list(A); n=len(A)
+    full=[(int(p)>>i)&1 for i in range(n)]+[0,0,1]
+    terminal=full[3:3+n]
+    for q,b in zip(A,terminal):
+        if b: qc.x(q)
+
+
 def _set_big_endian_constant(qc: QuantumCircuit, reg_be: Sequence[Qubit], value: int) -> None:
     width = len(reg_be)
     for i, q in enumerate(reg_be):
@@ -188,70 +246,101 @@ def _xor_encoded_bit_length_big_endian(qc: QuantumCircuit, bits_be: Sequence[Qub
 
 @lru_cache(maxsize=None)
 def _algorithm3_step_fastdual_gate(n: int, len_width: int, shift_width: int, T_max: int, aux_size: int, T: int) -> Instruction:
-    work_size = n + 3
-    num_qubits = 4 + 2 * work_size + 3 * len_width + shift_width + aux_size
-
+    work_size=n+3
+    num_qubits=4+2*work_size+3*len_width+shift_width+aux_size
     def _builder() -> QuantumCircuit:
         eea.set_measurement_uncompute(True)
-        Phase1 = QuantumRegister(1, "Phase1")
-        Phase2 = QuantumRegister(1, "Phase2")
-        Iter = QuantumRegister(1, "Iter")
-        Sign = QuantumRegister(1, "Sign")
-        Work1 = QuantumRegister(work_size, "Work1")
-        Work2 = QuantumRegister(work_size, "Work2")
-        l_t = QuantumRegister(len_width, "l_t")
-        l_q = QuantumRegister(len_width, "l_q")
-        l_s = QuantumRegister(shift_width, "l_s")
-        l_rp = QuantumRegister(len_width, "l_rp")
-        Aux = QuantumRegister(aux_size, "Aux")
-        q = QuantumCircuit(Phase1, Phase2, Iter, Sign, Work1, Work2, l_t, l_q, l_s, l_rp, Aux,
-                           name=f"ALG3_STEP_FASTDUAL_WRAPPED_DEF_T{T}_{n}")
-        eea.append_one_step_T(q, T=T, n=n, len_width=len_width, shift_width=shift_width,
-                              Phase1=Phase1, Phase2=Phase2, Iter=Iter, Sign=Sign,
-                              Work1=Work1, Work2=Work2, l_t=l_t, l_q=l_q, l_s=l_s, l_rp=l_rp, Aux=Aux)
+        Phase1=QuantumRegister(1,"Phase1"); Phase2=QuantumRegister(1,"Phase2"); Iter=QuantumRegister(1,"Iter"); Sign=QuantumRegister(1,"Sign")
+        Work1=QuantumRegister(work_size,"Work1"); Work2=QuantumRegister(work_size,"Work2")
+        l_t=QuantumRegister(len_width,"l_t"); l_q=QuantumRegister(len_width,"l_q"); l_s=QuantumRegister(shift_width,"l_s"); l_rp=QuantumRegister(len_width,"l_rp")
+        Aux=QuantumRegister(aux_size,"Aux")
+        q=QuantumCircuit(Phase1,Phase2,Iter,Sign,Work1,Work2,l_t,l_q,l_s,l_rp,Aux,name=f"ALG3_STEP_FASTDUAL_WRAPPED_DEF_T{T}_{n}")
+        eea.append_one_step_T(q,T=T,n=n,len_width=len_width,shift_width=shift_width,Phase1=Phase1,Phase2=Phase2,Iter=Iter,Sign=Sign,
+                              Work1=Work1,Work2=Work2,l_t=l_t,l_q=l_q,l_s=l_s,l_rp=l_rp,Aux=Aux)
         return q
+    # All measurement-based AND uncomputes in a step reuse one classical bit.
+    return LazyDefinedInstruction(f"ALG3_STEP_FASTDUAL_WRAPPED_T{T}_{n}",num_qubits,1,_builder)
 
-    return LazyDefinedInstruction(f"ALG3_STEP_FASTDUAL_WRAPPED_T{T}_{n}", num_qubits, 0, _builder)
+
+@lru_cache(maxsize=None)
+def _algorithm3_step_fastdual_inverse_gate(n: int, len_width: int, shift_width: int, T_max: int, aux_size: int, T: int) -> Instruction:
+    work_size=n+3
+    num_qubits=4+2*work_size+3*len_width+shift_width+aux_size
+    def _builder() -> QuantumCircuit:
+        eea.set_measurement_uncompute(True)
+        Phase1=QuantumRegister(1,"Phase1"); Phase2=QuantumRegister(1,"Phase2"); Iter=QuantumRegister(1,"Iter"); Sign=QuantumRegister(1,"Sign")
+        Work1=QuantumRegister(work_size,"Work1"); Work2=QuantumRegister(work_size,"Work2")
+        l_t=QuantumRegister(len_width,"l_t"); l_q=QuantumRegister(len_width,"l_q"); l_s=QuantumRegister(shift_width,"l_s"); l_rp=QuantumRegister(len_width,"l_rp")
+        Aux=QuantumRegister(aux_size,"Aux")
+        q=QuantumCircuit(Phase1,Phase2,Iter,Sign,Work1,Work2,l_t,l_q,l_s,l_rp,Aux,name=f"ALG3_STEP_FASTDUAL_WRAPPED_INV_DEF_T{T}_{n}")
+        eea.append_one_step_T_inverse(q,T=T,n=n,len_width=len_width,shift_width=shift_width,Phase1=Phase1,Phase2=Phase2,Iter=Iter,Sign=Sign,
+                                      Work1=Work1,Work2=Work2,l_t=l_t,l_q=l_q,l_s=l_s,l_rp=l_rp,Aux=Aux)
+        return q
+    return LazyDefinedInstruction(f"ALG3_STEP_FASTDUAL_WRAPPED_INV_T{T}_{n}",num_qubits,1,_builder)
 
 
 @lru_cache(maxsize=None)
 def forward_eea_shared_definition(n: int, p: int = SECP256K1_P, T_max: Optional[int] = None) -> QuantumCircuit:
-    layout = shared_eea_layout(n, T_max=T_max)
-    X = QuantumRegister(n, "X_le")
-    A = QuantumRegister(n, "A_large_workspace")
-    S = QuantumRegister(layout.s_qubits, "S_shared")
-    m = ClassicalRegister(max(1, n), "m_eea_wrapper")
-    qc = QuantumCircuit(X, A, S, m, name=f"EEA_SHARED_ALG3_FASTDUAL_WRAPPED_DEF_{n}")
-    parts = split_shared_s(S, n, T_max=T_max)
-
-    Work2 = _prepare_work2_from_little_endian_x(qc, X, parts["work2_tail"])
-    Work1 = parts["work1_tail"] + list(A)
-    _toggle_work1_constant(qc, Work1, p)
-
-    work2_rprime_le = list(reversed(Work2[3:3+n]))
-    dirty = Work1[:n]
-    clean3 = [parts["Aux"][1], parts["Aux"][2], parts["Aux"][3]]
-    cbits = list(m)[:n]
-
-    # Algorithm 1 preprocessing: if x > p/2, set Iter and run EEA on p-x.
-    append_gidney_compare_ge_const(qc, work2_rprime_le, p // 2 + 1, parts["Iter"][0], dirty, clean3, cbits)
-    _append_controlled_const_minus_mod2n_gidney(qc, parts["Iter"][0], work2_rprime_le, p, dirty, clean3, cbits)
-
-    lw = layout.len_width; sw = layout.shift_width
-    _xor_const_into_reg(qc, parts["l_q"], (1 << lw) - 1)       # ell_q = 0 encoded as -1
-    _xor_const_into_reg(qc, parts["l_s"], (1 << sw) - 1)       # ell_s = 0 encoded as -1
-    _xor_const_into_reg(qc, parts["l_t"], 0)                   # ell_t = 1 encoded as 0
-    _xor_encoded_bit_length_big_endian(qc, Work2[3:3+n], parts["l_rp"], parts["Aux"][0])
-
-    step_qubits = [parts["Phase1"][0], parts["Phase2"][0], parts["Iter"][0], parts["Sign"][0],
-                  *Work1, *Work2, *parts["l_t"], *parts["l_q"], *parts["l_s"], *parts["l_rp"], *parts["Aux"]]
-    for T in range(1, layout.T_max + 1):
-        qc.append(_algorithm3_step_fastdual_gate(n, lw, sw, layout.T_max, layout.step_aux, T), step_qubits)
-
-    # Algorithm 1 postprocessing: if Iter=0, convert t' to the positive inverse p-t'.
+    layout=shared_eea_layout(n,T_max=T_max)
+    X=QuantumRegister(n,"X_le"); A=QuantumRegister(n,"A_large_workspace"); S=QuantumRegister(layout.s_qubits,"S_shared")
+    m=ClassicalRegister(max(1,n),"m_eea_wrapper")
+    qc=QuantumCircuit(X,A,S,m,name=f"EEA_SHARED_ALG3_FASTDUAL_WRAPPED_DEF_{n}")
+    parts=split_shared_s(S,n,T_max=T_max)
+    Work2=_prepare_work2_from_little_endian_x(qc,X,parts["work2_tail"])
+    Work1=parts["work1_tail"]+list(A)
+    _toggle_work1_constant(qc,Work1,p)
+    work2_rprime_le=list(reversed(Work2[3:3+n])); dirty=Work1[:n]
+    clean3=[parts["Aux"][1],parts["Aux"][2],parts["Aux"][3]]; cbits=list(m)[:n]
+    append_gidney_compare_ge_const(qc,work2_rprime_le,p//2+1,parts["Iter"][0],dirty,clean3,cbits)
+    _append_controlled_const_minus_mod2n_gidney(qc,parts["Iter"][0],work2_rprime_le,p,dirty,clean3,cbits)
+    lw=layout.len_width; sw=layout.shift_width
+    _xor_const_into_reg(qc,parts["l_q"],(1<<lw)-1)
+    _xor_const_into_reg(qc,parts["l_s"],(1<<sw)-1)
+    _xor_encoded_bit_length_big_endian(qc,Work2[3:3+n],parts["l_rp"],parts["Aux"][0])
+    step_qubits=[parts["Phase1"][0],parts["Phase2"][0],parts["Iter"][0],parts["Sign"][0],*Work1,*Work2,*parts["l_t"],*parts["l_q"],*parts["l_s"],*parts["l_rp"],*parts["Aux"]]
+    for T in range(1,layout.T_max+1):
+        qc.append(_algorithm3_step_fastdual_gate(n,lw,sw,layout.T_max,layout.step_aux,T),step_qubits,[m[0]])
+    _canonical_unrotate_work2(qc,Work2,parts["l_s"],parts["Aux"])
     qc.x(parts["Iter"][0])
-    _append_controlled_const_minus_mod2n_gidney(qc, parts["Iter"][0], Work2[:n], p, dirty, clean3, cbits)
+    _append_controlled_const_minus_mod2n_gidney(qc,parts["Iter"][0],Work2[:n],p,dirty,clean3,cbits)
     qc.x(parts["Iter"][0])
+    # Algorithm 1 clears only the n-qubit large workspace; the remaining tails
+    # and metadata are the retained Gamma(x) state.
+    _toggle_terminal_large_workspace(qc,A,p)
+    return qc
+
+
+@lru_cache(maxsize=None)
+def inverse_eea_shared_definition(n: int, p: int = SECP256K1_P, T_max: Optional[int] = None) -> QuantumCircuit:
+    """Executable Figure-15 reverse EEA, not a relabelled forward placeholder."""
+    layout=shared_eea_layout(n,T_max=T_max)
+    X=QuantumRegister(n,"X_inverse_to_input"); A=QuantumRegister(n,"A_large_workspace"); S=QuantumRegister(layout.s_qubits,"S_shared")
+    m=ClassicalRegister(max(1,n),"m_eea_wrapper_inv")
+    qc=QuantumCircuit(X,A,S,m,name=f"EEA_SHARED_ALG3_FASTDUAL_WRAPPED_INV_DEF_{n}")
+    parts=split_shared_s(S,n,T_max=T_max)
+    # At this boundary X wires are Work2[0:n], and the tail wires retain the
+    # terminal circular-state metadata from the forward execution.
+    Work2=list(X)+parts["work2_tail"]
+    Work1=parts["work1_tail"]+list(A)
+    dirty=Work1[:n]; clean3=[parts["Aux"][1],parts["Aux"][2],parts["Aux"][3]]; cbits=list(m)[:n]
+    _toggle_terminal_large_workspace(qc,A,p)
+    qc.x(parts["Iter"][0])
+    _append_controlled_const_minus_mod2n_gidney(qc,parts["Iter"][0],Work2[:n],p,dirty,clean3,cbits)
+    qc.x(parts["Iter"][0])
+    _restore_terminal_rotation(qc,Work2,parts["l_s"],parts["Aux"])
+    lw=layout.len_width; sw=layout.shift_width
+    step_qubits=[parts["Phase1"][0],parts["Phase2"][0],parts["Iter"][0],parts["Sign"][0],*Work1,*Work2,*parts["l_t"],*parts["l_q"],*parts["l_s"],*parts["l_rp"],*parts["Aux"]]
+    for T in range(layout.T_max,0,-1):
+        qc.append(_algorithm3_step_fastdual_inverse_gate(n,lw,sw,layout.T_max,layout.step_aux,T),step_qubits,[m[0]])
+    # Undo Algorithm-1 metadata initialization.
+    _xor_encoded_bit_length_big_endian(qc,Work2[3:3+n],parts["l_rp"],parts["Aux"][0])
+    _xor_const_into_reg(qc,parts["l_s"],(1<<sw)-1)
+    _xor_const_into_reg(qc,parts["l_q"],(1<<lw)-1)
+    work2_rprime_le=list(reversed(Work2[3:3+n]))
+    _append_controlled_const_minus_mod2n_gidney(qc,parts["Iter"][0],work2_rprime_le,p,dirty,clean3,cbits)
+    append_gidney_compare_ge_const(qc,work2_rprime_le,p//2+1,parts["Iter"][0],dirty,clean3,cbits)
+    _toggle_work1_constant(qc,Work1,p)
+    _restore_little_endian_x_from_work2(qc,X,parts["work2_tail"])
     return qc
 
 
@@ -265,15 +354,11 @@ def eea_forward_shared_instruction(n: int, p: int = SECP256K1_P, *, T_max: Optio
 
 
 def eea_inverse_shared_instruction(n: int, p: int = SECP256K1_P, *, T_max: Optional[int] = None, lazy_definition: bool = True) -> Instruction:
-    # Dynamic measurement-based step definitions cannot be inverted by Qiskit's
-    # unitary inverse.  Fig.15 uses the reverse logical block with the same
-    # resource count; expose it as a separate definition-carrying instruction.
-    layout = shared_eea_layout(n, T_max=T_max)
-    builder = lambda: forward_eea_shared_definition(n, p, T_max)
+    layout=shared_eea_layout(n,T_max=T_max)
+    builder=lambda: inverse_eea_shared_definition(n,p,T_max)
     if lazy_definition:
-        return LazyDefinedInstruction(f"EEA_FORWARD_SHARED_ALG3_FASTDUAL_WRAPPED_{n}_dg", 2*n + layout.s_qubits, max(1, n), builder)
-    q = builder()
-    return q.to_instruction(label=f"EEA_FORWARD_SHARED_ALG3_FASTDUAL_WRAPPED_{n}_dg")
+        return LazyDefinedInstruction(f"EEA_INVERSE_SHARED_ALG3_FASTDUAL_WRAPPED_{n}",2*n+layout.s_qubits,max(1,n),builder)
+    return builder().to_instruction(label=f"EEA_INVERSE_SHARED_ALG3_FASTDUAL_WRAPPED_{n}")
 
 
 # Compatibility aliases used by some older scripts.

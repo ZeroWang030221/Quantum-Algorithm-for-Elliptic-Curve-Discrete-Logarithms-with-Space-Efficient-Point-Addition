@@ -5,7 +5,7 @@ from qiskit import ClassicalRegister, QuantumCircuit, QuantumRegister
 from qiskit.circuit import Clbit, Instruction, Qubit
 from qiskit.circuit.library import ZGate
 
-from under1000_eea_shared_s835_fastdual_wrapped import SECP256K1_P, eea_forward_shared_instruction, eea_inverse_shared_instruction, shared_eea_s_qubits
+from under1000_eea_shared_s835_fastdual_wrapped import (SECP256K1_P, eea_forward_shared_instruction, eea_inverse_shared_instruction, shared_eea_s_qubits, split_shared_s)
 from quadratic_modular_arithmetic import mul_zero_dbladd_instruction, mul_zero_dbladd_inverse_instruction
 
 
@@ -51,7 +51,7 @@ def append_inplace_division_fig15_quadratic(qc: QuantumCircuit, X: Sequence[Qubi
     eea_inv = eea_inv_inst or eea_inverse_shared_instruction(n, p)
     mul = mul_zero_dbladd_instruction(n, p)
     mul_inv = mul_zero_dbladd_inverse_instruction(n, p)
-    aux5 = list(S[:5])
+    aux5 = list(split_shared_s(S, n)["Aux"][:5])
     qc.append(eea, X + A + S[:s_used], m_arith[:n])
     qc.append(mul, X + Y + A + aux5, m_arith[:n])
     append_measure_reset_h_basis(qc, Y, b)
@@ -70,7 +70,7 @@ def append_inplace_multiplication_fig15_quadratic(qc: QuantumCircuit, X: Sequenc
     eea_inv = eea_inv_inst or eea_inverse_shared_instruction(n, p)
     mul = mul_zero_dbladd_instruction(n, p)
     mul_inv = mul_zero_dbladd_inverse_instruction(n, p)
-    aux5 = list(S[:5])
+    aux5 = list(split_shared_s(S, n)["Aux"][:5])
     qc.append(mul, X + Y + A + aux5, m_arith[:n])
     append_measure_reset_h_basis(qc, Y, b)
     qc.append(eea, X + Y + S[:s_used], m_arith[:n])
