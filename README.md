@@ -39,9 +39,46 @@ The current codebase is centered on three workflows:
 │
 ├── ccx_recursive_block_counter.py
 ├── nct_template_segment_optimizer.py
+├── run_eea_s835_fastdual_recursive_chunks_checkpoint.py
+├── run_eea_s835_fastdual_recursive_chunks_checkpoint_nctopt.py
+├── count_s835_fastdual_wrapped_point_addition_blocks_compiled.py
 │
+├── test_paper_alignment_gate_structure.py
+├── test_fastdual_interval_selector.py
+├── test_explicit_measurement_inverse_blocks.py
+├── test_reachable_step_forward_inverse.py
+│
+├── extended_semantic_sweep.py
+├── test_p419_per_step_oracle.py
+├── test_generic_per_step_oracle.py
+├── test_p419_x153_quantum_semantics.py
+├── test_exhaustive_small_prime_matrix.py
+├── hash_derived_large_prime_sweep.py
+│
+├── test_terminal_shift_epoch_835.py
+├── test_terminal_padding_width_matrix.py
+│
+├── test_small_field_point_addition_semantics.py
+├── test_small_field_point_addition_coherence.py
+├── official_style_qiskit_harness.py
+├── test_official_style_eea_harness.py
+├── test_official_style_point_add_harness.py
+├── test_official_style_point_add_roundtrip.py
+├── test_exhaustive_measurement_transcripts_tiny.py
+├── test_harness_mutation_sensitivity.py
+│
+├── test_no_opaque_counts.py
+├── test_no_opaque_matrix.py
 ├── test_eea_strict_main.py
-└── test_point_addition_strict_main.py
+├── test_point_addition_strict_main.py
+│
+├── test_coherent_eea_pair_matrix.py
+├── test_secp256k1_schedule_witness.py
+│
+├── run_all_real_qiskit_validation.ps1
+├── run_all_real_qiskit_validation.sh
+├── run_extended_real_qiskit_validation.ps1
+└── run_extended_real_qiskit_validation.sh
 ```
 
 ### Main entry scripts
@@ -100,14 +137,9 @@ python -m pip install qiskit
 Run the test suite:
 
 ```bash
-python test_eea_strict_main.py
-python test_point_addition_strict_main.py
-```
-
-For a faster point-addition smoke test:
-
-```bash
-python test_point_addition_strict_main.py --skip-n256 --skip-report
+bash ./run_all_real_qiskit_validation.sh
+bash ./run_extended_real_qiskit_validation.sh
+FULL=1 bash ./run_extended_real_qiskit_validation.sh
 ```
 
 ---
@@ -277,85 +309,236 @@ The point-addition counter builds reusable Qiskit circuits, recursively counts t
 
 ## Tests
 
-This repository includes two plain Python test drivers.  They are intentionally written without `pytest`, Aer, or full statevector simulation.  The tests recursively expand Qiskit definitions where appropriate and simulate computational-basis states for Toffoli-network blocks.
+The validation suite uses emitted Qiskit circuit definitions to produce the result under test. The classical EEA and affine point-addition implementations are used only to compute independent expected values.
 
-### EEA strict tests
+The different tests target different failure modes.
 
-The EEA tests are in:
+### 1. Paper/circuit structural alignment
+
+Goal: verify that the production circuit has the intended paper-level structure rather than only the correct final classical answer.
+
+Relevant tests:
 
 ```text
+test_paper_alignment_gate_structure.py
+test_fastdual_interval_selector.py
+test_explicit_measurement_inverse_blocks.py
+test_reachable_step_forward_inverse.py
 test_eea_strict_main.py
-```
-
-Run the default EEA suite with:
-
-```bash
-python test_eea_strict_main.py
-```
-
-The default suite checks:
-
-- the implementation is not a small-`n` endpoint shortcut;
-- the Algorithm-3 dashed-block schedule is present;
-- active-window formulas over several small widths;
-- unary iteration, pre/post shift, phase update, location-controlled swap, and length-update blocks;
-- Algorithm-3 endpoints for the default primes `3, 5, 7, 11, 13, 17`, using both exact step counts and fixed `T_max`;
-- the full Algorithm-1 wrapper for small default primes `3, 5, 7`.
-
-Useful variants:
-
-```bash
-# Fast structural + block tests only.
-python test_eea_strict_main.py --skip-endpoint --skip-alg1
-
-# Include the heavier PDF/Table-4 p=37, x=13 trace benchmark.
-python test_eea_strict_main.py --table4
-
-# Test all x values for primes above 13 as well.
-python test_eea_strict_main.py --primes 3 5 7 11 13 17 --mid-all-x --verbose
-```
-
-### Point-addition strict tests
-
-The point-addition tests are in:
-
-```text
 test_point_addition_strict_main.py
 ```
 
-Run the default point-addition suite with:
+These checks include:
+
+- the Figure-11 matched MAJ/UMA primitive structure;
+- the fast dual-unary R-side implementation;
+- the active-window formulas;
+- explicit measurement-assisted inverse blocks;
+- forward/inverse consistency of reachable Algorithm-3 steps;
+- the `n = 256` 835-qubit register layout;
+- Figure-14/Figure-15 operation ordering;
+- recursively compiled arithmetic-block assembly.
+
+The fast dual-unary selector has been compared with the corresponding direct ripple implementation over **15,360 tested basis-state configurations**, all of which pass.
+
+### 2. Exhaustive EEA test for p = 419
+
+Goal: verify arithmetic correctness and fixed-schedule control flow for every nonzero input of the reported small field.
+
+Run:
 
 ```bash
-python test_point_addition_strict_main.py
+python extended_semantic_sweep.py 419 --all --require-real-qiskit
 ```
 
-The default point-addition suite checks:
+Because `p = 419` is a 9-bit prime, this test uses the complete 9-bit schedule:
 
-- wrapped point-addition register layout;
-- the `n=256` width identity `835 = 1 + 3*256 + 66`;
-- Fig.14/Fig.15 top-level operation order;
-- explicit dynamic-circuit structure involving `H`, `measure`, `reset`, classically controlled `Z`, and `swap` operations;
-- compiled arithmetic subblock assembly for a small modulus;
-- a tiny integrated point-addition counter report using a synthetic Algorithm-3 JSON, so the report path is tested without running a large EEA count.
+```text
+n = 9
+T_max = 60
+```
 
-The large-prime regression matrix covers representative pairs of the field bit width `n` and prime modulus `p`, ranging from 12-bit to 512-bit prime fields.  The tested instances include, for example, `n=16, p=65521`, `n=32, p=4294967291`, the secp256k1 prime at `n=256`, and representative primes at `n=128, 160, 192, 224, 384, 512`.
+Current result:
 
-For each `(n,p)` pair, the tests include boundary, symmetric, random, and relatively long EEA traces.  Full compiled-arithmetic assembly is run only for selected moderate-width instances, while the larger `(n,p)` pairs are used to validate circuit construction, register layout, scheduling, and recursive resource-counting paths.
+```text
+418 / 418 nonzero inputs passed
+```
 
-Useful variants:
+### 3. Step-by-step Algorithm-3 comparison
+
+Goal: locate an incorrect state transition immediately instead of checking only the final modular inverse.
+
+Run:
 
 ```bash
-# Skip the tiny integrated report and only check construction/schedule/assembly.
-python test_point_addition_strict_main.py --skip-report
-
-# Fast smoke test that also skips the n=256 width construction check.
-python test_point_addition_strict_main.py --skip-n256 --skip-report
-
-# Use a different small prime/width for compiled-block validation.
-python test_point_addition_strict_main.py --n 5 --p 17
+python test_p419_per_step_oracle.py --require-real-qiskit
 ```
 
-If Qiskit is not installed, `test_point_addition_strict_main.py` prints a skip message and exits successfully.  The EEA strict test requires Qiskit because it builds the EEA/PDF block gates.
+After each Algorithm-3 step, the state encoded by the Qiskit circuit is decoded into the corresponding EEA variables and phase/length information and compared with an independent classical implementation advanced through the same step.
+
+Current result for `p = 419`:
+
+```text
+19,528 / 19,528 step-state comparisons passed
+```
+
+This test includes the previously problematic `x = 1`, step-34 region.
+
+### 4. Coherent EEA forward/inverse regression
+
+Goal: verify that measurement-assisted uncomputation and classical feed-forward preserve relative phase between different input branches, while also restoring the input and cleaning the workspace after the inverse.
+
+Run:
+
+```bash
+python test_p419_x153_quantum_semantics.py \
+  --shots 8 \
+  --require-real-qiskit \
+  --verbose
+```
+
+The test uses the two input branches `x = 153` and `x = 155`. It executes the emitted dynamic circuit, including Hadamard gates, mid-circuit measurements, resets, and feed-forward `Z/CZ` corrections.
+
+In the current real-Qiskit run:
+
+- `153 -> 241` and `155 -> 246` in the forward map;
+- all eight tested coherent forward/inverse trajectories have fidelity 1;
+- the relative phase is preserved;
+- `X` is restored by the round trip;
+- every `A/S` workspace qubit is returned to zero.
+
+### 5. n = 256 fixed-schedule terminal behavior
+
+Goal: verify that branches that finish their EEA arithmetic early remain reversible through the rest of the common `T_max(256) = 1620` schedule.
+
+Run:
+
+```bash
+python test_terminal_shift_epoch_835.py
+```
+
+For `n = 256`:
+
+```text
+T_max                = 1620
+maximum padding      = 596 steps
+reachable test cases = 149
+logical qubits       = 835
+```
+
+All 149 reachable terminal-padding depths pass, including the low-word wrap boundary and the maximum 596-step padding case.
+
+The broader width matrix covers widths from 4 through 512 bits and verifies terminal canonicalization and selected forward/inverse round trips.
+
+### 6. Complete Figure-14 point addition
+
+Goal: verify that the modular-arithmetic, Figure-15, and coordinate-update components remain correct after composition into the complete Figure-14 point-addition circuit.
+
+Relevant tests:
+
+```text
+test_small_field_point_addition_semantics.py
+test_small_field_point_addition_coherence.py
+test_official_style_point_add_harness.py
+test_official_style_point_add_roundtrip.py
+```
+
+Current small-field semantic result:
+
+```text
+68 / 68 generic affine cases passed
+```
+
+The validation additionally checks:
+
+- active and inactive control branches;
+- workspace cleanup;
+- a coherent two-branch point-addition example;
+- add-P followed by add-(-P) round trips;
+- representative larger-prime regressions.
+
+The real-Qiskit base suite also passes the current 16-bit and 32-bit regression sets:
+
+```text
+p = 65521       : 41 / 41
+p = 4294967291  : 21 / 21
+```
+
+### 7. ECDSAfail-style artifact-derived tests
+
+Goal: independently exercise the emitted Qiskit definitions using circuit-derived test inputs while separately checking classical output, measurement-dependent phase, and ancilla cleanup.
+
+Relevant files:
+
+```text
+official_style_qiskit_harness.py
+test_official_style_eea_harness.py
+test_official_style_point_add_harness.py
+test_official_style_point_add_roundtrip.py
+```
+
+The extended real-Qiskit run includes thousands of artifact-derived trajectories for EEA and complete small-field Figure-14 circuits.
+
+These tests are **ECDSAfail-style validation of the Qiskit implementation**. They are not the same as submitting a native KMX circuit to the official `ecdsafail` Rust grader.
+
+Direct official KMX validation requires a Qiskit-to-KMX lowering path and the interface expected by the official harness.
+
+### 8. Fail-closed recursive decomposition
+
+Goal: ensure that an undecomposed arithmetic block, unsupported gate, or stopped subcircuit cannot be silently treated as one elementary operation.
+
+Relevant tests:
+
+```text
+test_no_opaque_counts.py
+test_no_opaque_matrix.py
+```
+
+The recursive inspection enters supported circuit definitions and control-flow bodies and reports failure if an unresolved term is encountered.
+
+The current tested paths report:
+
+```text
+opaque_terms  = {}
+stopped_terms = {}
+```
+
+The full no-opaque matrix also includes representative Algorithm-3 steps up to `T = 1620` at `n = 256`.
+
+---
+
+## Current validation status
+
+The base validation suite has been run under **real Qiskit 2.4.1** and completed successfully.
+
+Representative completed results include:
+
+| Test | Result |
+|---|---:|
+| `p = 419`, all nonzero inputs, complete `T_max(9) = 60` schedule | 418 / 418 |
+| `p = 419` per-step state comparisons | 19,528 / 19,528 |
+| coherent EEA 153/155 regression | 8 / 8 trajectories, fidelity 1 |
+| fast dual-unary selector | 15,360 / 15,360 |
+| `n = 256` reachable terminal-padding depths | 149 / 149 |
+| complete small-field Figure-14 cases | 68 / 68 |
+| 16-bit regression (`p = 65521`) | 41 / 41 |
+| 32-bit regression (`p = 4294967291`) | 21 / 21 |
+| strict EEA groups | 10 / 10 |
+| strict point-addition groups | 4 / 4 |
+| recursive no-opaque base audit | passed |
+
+The extended suite additionally contains:
+
+- a 37-prime exhaustive EEA matrix;
+- per-step matrices over several primes;
+- ECDSAfail-style forward and forward/inverse tests;
+- complete Figure-14 artifact-derived tests;
+- terminal-padding width matrices;
+- measurement-transcript tests;
+- mutation-sensitivity tests;
+- larger no-opaque matrices.
+
+The `-Full` / `FULL=1` mode is intentionally long-running and should be treated separately from the completed base validation.
 
 ---
 
