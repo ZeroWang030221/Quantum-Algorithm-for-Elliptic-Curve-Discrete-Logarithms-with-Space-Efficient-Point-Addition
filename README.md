@@ -496,7 +496,7 @@ Representative completed results include:
 
 | Test | Result |
 |---|---:|
-| `p = 419`, all nonzero inputs, complete `T_max(9) = 60` schedule | 418 / 418 |
+| `p = 419`, all nonzero inputs | 418 / 418 |
 | `p = 419` per-step state comparisons | 19,528 / 19,528 |
 | coherent EEA 153/155 regression | 8 / 8 trajectories, fidelity 1 |
 | fast dual-unary selector | 15,360 / 15,360 |
