@@ -1,4 +1,14 @@
 import argparse
+
+# Use real Qiskit when available; otherwise install the bundled circuit-data
+# model so the structural tests can still build and recursively inspect the
+# exact production definitions.
+try:
+    import qiskit  # type: ignore
+except Exception:
+    import mini_qiskit_runtime as _mini
+    _mini.install_as_qiskit()
+
 import inspect
 import math
 import time
@@ -389,17 +399,15 @@ def test_step_schedule_structure() -> None:
 
 
 def expected_active_windows(n: int, T: int) -> Dict[str, Tuple[int, int]]:
-    c = 3.0 / math.log2(2.0 + math.sqrt(3.0))
-    ceil = lambda x: math.ceil(x - 1e-12)
-    floor = lambda x: math.floor(x + 1e-12)
+    lam=(2.0+math.sqrt(3.0))**(1.0/3.0);c=1.0/math.log2(lam)
+    delta=-math.log(((4.0*math.sqrt(3.0)-3.0)/13.0)*(lam**2),lam)
+    ceil=lambda x:math.ceil(x-1e-12);floor=lambda x:math.floor(x+1e-12)
     return {
-        "r_addsub": (max(ceil((T - (n + 2)) / (4.0 * c - 1.0)), 1) + 2, n + 3),
-        "swap": (max(ceil((T - 3.0 * (n + 2)) / (4.0 * c - 3.0)), 1) + 1,
-                  min(floor(T / 2.0) + 2, n + 2)),
-        "t_addsub": (1, min(ceil(T / 4.0) + 1, n + 1)),
-        "len_update_lt": (max(ceil((T - 4.0 * (n + 2)) / (4.0 * c - 4.0)), 1),
-                          min(floor(T / 4.0 + 3.0), n + 3)),
-        "len_update_lrp": (ceil(T / (4.0 * c)), min(floor(T / 4.0 + 4.0), n + 3)),
+      "r_addsub":(max(ceil((T-n-1-4*delta)/(4*c-1)),1)+2,n+3),
+      "swap":(max(ceil((T-3*(n+1)-4*delta)/(4*c-3)),1)+1,min(floor(T/2)+2,n+2)),
+      "t_addsub":(1,min(floor(T/4)+2,n+1)),
+      "len_update_lt":(max(ceil((T-4*(n+1)-4*delta)/(4*c-4)),1),min(floor(T/4)+3,n+2)),
+      "len_update_lrp":(max(ceil((T-4*delta)/(4*c)),1)+2,n+3),
     }
 
 

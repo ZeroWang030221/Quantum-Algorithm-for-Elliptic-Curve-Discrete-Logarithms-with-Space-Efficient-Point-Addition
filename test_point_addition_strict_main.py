@@ -1,4 +1,14 @@
 import argparse
+
+# Use real Qiskit when available; otherwise install the bundled circuit-data
+# model so the structural tests can still build and recursively inspect the
+# exact production definitions.
+try:
+    import qiskit  # type: ignore
+except Exception:
+    import mini_qiskit_runtime as _mini
+    _mini.install_as_qiskit()
+
 import gc
 import json
 import math
@@ -244,7 +254,12 @@ def test_tiny_point_addition_counter_report(*, small_n: int, small_p: int) -> No
         "T_max": int(layout.T_max),
         "num_qubits": int(4 + 2 * (small_n + 3) + 3 * layout.len_width + layout.shift_width + layout.step_aux),
         "range": [1, int(layout.T_max)],
-        "ops": {"x": 0, "cx": 0, "ccx": 0, "h": 0, "measure": 0, "reset": 0},
+        # The current forward and explicit inverse EEA use the paper's
+        # measurement-assisted unary-AND cleanup.  Keep one representative
+        # dynamic primitive in this synthetic integration fixture so the count
+        # assembler can reject a coherent/measurement-mode mismatch while the
+        # test remains fast.
+        "ops": {"x": 0, "cx": 0, "ccx": 0, "h": 1, "cz": 1, "measure": 1, "reset": 1},
     }
     with tempfile.TemporaryDirectory() as td:
         eea_json = Path(td) / "synthetic_eea_counts.json"
@@ -268,7 +283,11 @@ def test_tiny_point_addition_counter_report(*, small_n: int, small_p: int) -> No
     _assert(width["num_qubits"] == 1 + 3 * small_n + shared_eea_s_qubits(small_n), f"counter width report mismatch: {width}")
     _assert(width["has_only_ctrl_X_Y_A_S_qregs"] is True, f"unexpected qreg layout in counter width report: {width}")
     _assert(width["has_extra_E_or_R_registers"] is False, f"counter should not report extra E/R registers: {width}")
-    _assert(report["eea_meta"]["skipped_alg3_steps_in_wrapper"] == layout.T_max, f"EEA wrapper did not stop on T_max step instructions: {report['eea_meta']}")
+    _assert(
+        report["eea_meta"]["forward"]["skipped_alg3_steps_in_wrapper"] == layout.T_max
+        and report["eea_meta"]["inverse"]["skipped_alg3_steps_in_wrapper"] == layout.T_max,
+        f"EEA wrappers did not stop on T_max step instructions: {report['eea_meta']}",
+    )
     _assert(report["validation"] and report["validation"].get("all_passed"), f"report validation failed: {report.get('validation')}")
     _assert(report["key_ccx"]["point_addition_fig14_total"] > 0, f"total point-addition CCX count should be positive: {report['key_ccx']}")
     for name, summary in report["block_summaries"].items():
@@ -1094,7 +1113,7 @@ def main() -> None:
             )
 
     print("Strict S835 wrapped point-addition tests")
-    print(f"Qiskit: {qiskit.__version__}")
+    print(f"Qiskit: {getattr(qiskit, "__version__", "mini-data-model")}")
     print(f"small test parameters: n={args.n}, p={args.p}")
     if args.skip_large_primes:
         print("larger-prime regressions: skipped\n")
@@ -1170,7 +1189,7 @@ def main() -> None:
 
     report = {
         "test": "point-addition-strict-with-integrated-large-prime-regressions",
-        "qiskit_version": qiskit.__version__,
+        "qiskit_version": getattr(qiskit, "__version__", "mini-data-model"),
         "small_parameters": {"n": args.n, "p": args.p},
         "large_primes": [] if args.skip_large_primes else large_primes,
         "compiled_primes": (

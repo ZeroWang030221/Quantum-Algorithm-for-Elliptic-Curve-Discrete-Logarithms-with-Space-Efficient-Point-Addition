@@ -29,15 +29,13 @@ def _as_list(xs: Sequence[Qubit]) -> list[Qubit]:
 
 
 def _cond_z(qc: QuantumCircuit, c: Clbit, q: Qubit) -> None:
-    op = ZGate().to_mutable()
-    op.condition = (c, 1)
-    qc.append(op, [q], [])
+    with qc.if_test((c, True)):
+        qc.z(q)
 
 
 def _cond_cz(qc: QuantumCircuit, c: Clbit, a: Qubit, b: Qubit) -> None:
-    op = CZGate().to_mutable()
-    op.condition = (c, 1)
-    qc.append(op, [a, b], [])
+    with qc.if_test((c, True)):
+        qc.cz(a, b)
 
 
 def _hmr(qc: QuantumCircuit, q: Qubit, c: Clbit) -> None:

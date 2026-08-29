@@ -26,11 +26,8 @@ def append_measure_reset_h_basis(qc: QuantumCircuit, reg: Sequence[Qubit], creg:
 
 
 def append_classically_controlled_z(qc: QuantumCircuit, q: Qubit, c: Clbit) -> None:
-    try:
-        with qc.if_test((c, 1)):
-            qc.z(q)
-    except Exception:
-        op = ZGate().to_mutable(); op.condition = (c, 1); qc.append(op, [q], [])
+    with qc.if_test((c, True)):
+        qc.z(q)
 
 
 def append_z_correction_vector(qc: QuantumCircuit, reg: Sequence[Qubit], creg: Sequence[Clbit]) -> None:

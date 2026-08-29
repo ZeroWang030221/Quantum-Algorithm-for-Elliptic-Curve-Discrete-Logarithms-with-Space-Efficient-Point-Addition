@@ -1,17 +1,29 @@
 import argparse
 import json
+import hashlib
 import math
 import time
 from collections import Counter
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
+try:
+    import qiskit  # type: ignore
+except Exception:
+    import mini_qiskit_runtime as _mini
+    _mini.install_as_qiskit()
+
 from qiskit import ClassicalRegister, QuantumCircuit, QuantumRegister
 
 import eea_circuit_s835_fastdual as eea
 from ccx_recursive_block_counter import CounterPolicy, count_gate_or_circuit, summarize_counter
 from point_addition_fig14_s835_fastdual_wrapped_quadratic import build_point_addition_fig14_quadratic
-from under1000_eea_shared_s835_fastdual_wrapped import SECP256K1_P, eea_forward_shared_instruction, shared_eea_layout
+from under1000_eea_shared_s835_fastdual_wrapped import (
+    SECP256K1_P,
+    eea_forward_shared_instruction,
+    eea_inverse_shared_instruction,
+    shared_eea_layout,
+)
 from quadratic_modular_arithmetic import (
     add_const_modp_instruction,
     neg_modp_instruction,
@@ -185,45 +197,94 @@ def _load_eea_alg3_counts(path: Optional[str], n: int, *, allow_n_mismatch: bool
     return ops, meta
 
 
-def count_compiled_eea_shared(n: int, p: int, policy: CounterPolicy, eea_steps_json: Optional[str], *, allow_n_mismatch: bool = False) -> tuple[Counter, dict[str, Any]]:
-    """Count shared EEA block using real wrapper definition + loaded recursive steps."""
-    layout = shared_eea_layout(n)
-    skip_policy = CounterPolicy(
-        mcx_policy=policy.mcx_policy,
-        expand_swap_to_cx=policy.expand_swap_to_cx,
-        skip_alg3_steps=True,
-        stop_prefixes=policy.stop_prefixes,
-    )
-    g = eea_forward_shared_instruction(n, p)
-    # The wrapped fastdual EEA step instructions are real definitions.  For n=256
-    # we avoid expanding all fixed-schedule step bodies here and instead load the chunk
-    # counts obtained by recursively counting the same step circuits.  The
-    # counter stops on the step instruction name and records STOP:: entries.
+def _count_eea_wrapper_without_steps(
+    inst: Any, *, direction: str, layout: Any, policy: CounterPolicy
+) -> tuple[Counter, dict[str, Any]]:
+    """Recursively count one EEA wrapper while stopping on Algorithm-3 bodies.
+
+    Forward and inverse wrappers are counted separately.  Both use the same
+    measurement-assisted Algorithm-3 implementation, but their Algorithm-1
+    preparation/cleanup order is different and must not be represented by a
+    duplicated forward count.
+    """
     stop_policy = CounterPolicy(
         mcx_policy=policy.mcx_policy,
         expand_swap_to_cx=policy.expand_swap_to_cx,
         skip_alg3_steps=False,
         stop_prefixes=("alg3_step_fastdual_wrapped_t", "alg3_step_fastdual_t"),
     )
-    wrapper = count_gate_or_circuit(g, policy=stop_policy)
-    stop_keys = [k for k in wrapper if str(k).startswith("STOP::alg3_step_fastdual")]
+    wrapper = count_gate_or_circuit(inst, policy=stop_policy)
+    stop_keys = [k for k in wrapper if str(k).lower().startswith("stop::alg3_step_fastdual")]
     skipped = sum(int(wrapper[k]) for k in stop_keys)
     for k in stop_keys:
         del wrapper[k]
     wrapper["meta::skipped_alg3_step"] += skipped
     if skipped != int(layout.T_max):
-        raise RuntimeError(f"EEA wrapper stopped on {skipped} Algorithm-3 steps, expected {layout.T_max}.")
-    alg3, alg3_meta = _load_eea_alg3_counts(eea_steps_json, n, allow_n_mismatch=allow_n_mismatch)
-    full = wrapper + alg3
+        raise RuntimeError(
+            f"{direction} EEA wrapper stopped on {skipped} Algorithm-3 steps, "
+            f"expected {layout.T_max}."
+        )
+    return wrapper, {
+        "direction": direction,
+        "gate_qubits": int(inst.num_qubits),
+        "gate_clbits": int(inst.num_clbits),
+        "skipped_alg3_steps_in_wrapper": skipped,
+        "wrapper_overhead_compiled_recursive": _jsonable_counter(wrapper),
+    }
+
+
+def count_compiled_eea_shared(
+    n: int,
+    p: int,
+    policy: CounterPolicy,
+    eea_steps_json: Optional[str],
+    *,
+    allow_n_mismatch: bool = False,
+) -> tuple[Counter, Counter, dict[str, Any]]:
+    """Count the exact forward and inverse EEA blocks used by Figure 15.
+
+    The fixed-schedule Algorithm-3 count is loaded once from the recursive
+    chunk JSON because the explicit inverse uses the same measurement-assisted
+    block costs in reverse order.  The two Algorithm-1 wrappers are recursively
+    compiled separately and then combined with that common step total.
+    """
+    layout = shared_eea_layout(n, p=p)
+    fwd_inst = eea_forward_shared_instruction(n, p)
+    inv_inst = eea_inverse_shared_instruction(n, p)
+    fwd_wrapper, fwd_meta = _count_eea_wrapper_without_steps(
+        fwd_inst, direction="forward", layout=layout, policy=policy
+    )
+    inv_wrapper, inv_meta = _count_eea_wrapper_without_steps(
+        inv_inst, direction="inverse", layout=layout, policy=policy
+    )
+
+    alg3, alg3_meta = _load_eea_alg3_counts(
+        eea_steps_json, n, allow_n_mismatch=allow_n_mismatch
+    )
+    if not bool(alg3_meta.get("measurement_based")):
+        raise RuntimeError(
+            "The current Figure-15 EEA uses measurement-assisted explicit "
+            "Algorithm-3 forward/inverse blocks, but the supplied EEA JSON "
+            "does not contain H/measure/reset/CZ terms. Regenerate it with "
+            "--measurement-uncompute."
+        )
+    expected_tmax = int(layout.T_max)
+    got_tmax = alg3_meta.get("T_max")
+    if got_tmax is not None and int(got_tmax) != expected_tmax:
+        raise RuntimeError(
+            f"EEA JSON T_max={got_tmax} does not match wrapper T_max={expected_tmax}."
+        )
+
+    forward = fwd_wrapper + alg3
+    inverse = inv_wrapper + alg3
     meta = {
         "layout": layout.as_dict(),
-        "eea_forward_gate_qubits": int(g.num_qubits),
-        "skipped_alg3_steps_in_wrapper": skipped,
         "algorithm3_ops_loaded": _jsonable_counter(alg3),
-        "shared_wrapper_overhead_compiled_recursive": _jsonable_counter(wrapper),
+        "forward": fwd_meta,
+        "inverse": inv_meta,
         **alg3_meta,
     }
-    return full, meta
+    return forward, inverse, meta
 
 
 def fig15_outer_dynamic_overhead(n: int) -> Counter:
@@ -238,17 +299,24 @@ def fig15_outer_dynamic_overhead(n: int) -> Counter:
     })
 
 
-def assemble_fig14_fig15(blocks: dict[str, Counter], eea_forward: Counter, n: int) -> dict[str, Counter]:
+def assemble_fig14_fig15(
+    blocks: dict[str, Counter],
+    eea_forward: Counter,
+    eea_inverse: Counter,
+    n: int,
+) -> dict[str, Counter]:
     outer = fig15_outer_dynamic_overhead(n)
     mul = blocks["mul_zero_dbladd"]
     mul_inv = blocks["mul_zero_dbladd_inverse"]
     square = blocks["square_zero_dbladd"]
     square_inv = blocks["square_zero_dbladd_inverse"]
 
-    # The real Fig.15 implementations contain two EEA-shaped blocks and three
-    # multiplication-shaped blocks: mul, recompute mul, and inverse mul.
-    idiv = _scale(eea_forward, 2) + _scale(mul, 2) + mul_inv + outer
-    imul = _scale(eea_forward, 2) + _scale(mul, 2) + mul_inv + outer
+    # Each real Fig.15 block contains one forward EEA and one explicit
+    # measurement-assisted inverse EEA, plus two forward multiplications and
+    # one inverse multiplication.  Count the two wrappers separately rather
+    # than duplicating the forward wrapper.
+    idiv = eea_forward + eea_inverse + _scale(mul, 2) + mul_inv + outer
+    imul = eea_forward + eea_inverse + _scale(mul, 2) + mul_inv + outer
     squ_minus = square + blocks["ctrl_sub_modp"] + square_inv
 
     point = Counter()
@@ -264,6 +332,7 @@ def assemble_fig14_fig15(blocks: dict[str, Counter], eea_forward: Counter, n: in
 
     return {
         "eea_forward_shared": eea_forward,
+        "eea_inverse_shared": eea_inverse,
         "idiv_fig15": idiv,
         "imul_fig15": imul,
         "squ_minus": squ_minus,
@@ -281,6 +350,26 @@ def resolve_constants(kind: str, x2: Optional[int], y2: Optional[int]) -> tuple[
     return int(x2), int(y2), "custom"
 
 
+def _sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _production_source_sha256() -> dict[str, str]:
+    root = Path(__file__).resolve().parent
+    names = (
+        "point_addition_fig14_s835_fastdual_wrapped_quadratic.py",
+        "quadratic_fig15_inplace_s835_fastdual_wrapped.py",
+        "quadratic_modular_arithmetic.py",
+        "quadratic_gidney_arithmetic.py",
+        "quadratic_squ_minus.py",
+        "under1000_eea_shared_s835_fastdual_wrapped.py",
+        "eea_circuit_s835_fastdual.py",
+        "eea_circuit_updated.py",
+        "ccx_recursive_block_counter.py",
+    )
+    return {name: _sha256_file(root / name) for name in names}
+
+
 def build_report(args: argparse.Namespace) -> dict[str, Any]:
     t0 = time.perf_counter()
     x2, y2, const_kind = resolve_constants(args.point_constant, args.x2, args.y2)
@@ -290,8 +379,14 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     blocks = count_compiled_arithmetic_subblocks(args.n, args.p, x2, y2, policy)
     assemble_mul_square_from_compiled_primitives(blocks, args.n)
 
-    eea_forward, eea_meta = count_compiled_eea_shared(args.n, args.p, policy, args.eea_steps_json, allow_n_mismatch=args.allow_eea_n_mismatch)
-    derived = assemble_fig14_fig15(blocks, eea_forward, args.n)
+    eea_forward, eea_inverse, eea_meta = count_compiled_eea_shared(
+        args.n,
+        args.p,
+        policy,
+        args.eea_steps_json,
+        allow_n_mismatch=args.allow_eea_n_mismatch,
+    )
+    derived = assemble_fig14_fig15(blocks, eea_forward, eea_inverse, args.n)
     all_blocks = {**blocks, **derived}
 
     validation = None
@@ -322,8 +417,8 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "square_zero_dbladd": {"ctrl_add_modp": args.n, "dbl_modp": args.n - 1, "copy_uncompute_cx": 2 * args.n},
         "square_zero_dbladd_inverse": {"ctrl_sub_modp": args.n, "halve_modp": args.n - 1, "copy_uncompute_cx": 2 * args.n},
         "squ_minus": {"square_zero_dbladd": 1, "ctrl_sub_modp": 1, "square_zero_dbladd_inverse": 1},
-        "idiv_fig15": {"eea_forward_or_inverse": 2, "mul_zero_dbladd": 2, "mul_zero_dbladd_inverse": 1, "outer_h_measure_reset_z_swap": 1},
-        "imul_fig15": {"eea_forward_or_inverse": 2, "mul_zero_dbladd": 2, "mul_zero_dbladd_inverse": 1, "outer_h_measure_reset_z_swap": 1},
+        "idiv_fig15": {"eea_forward_shared": 1, "eea_inverse_shared": 1, "mul_zero_dbladd": 2, "mul_zero_dbladd_inverse": 1, "outer_h_measure_reset_z_swap": 1},
+        "imul_fig15": {"eea_forward_shared": 1, "eea_inverse_shared": 1, "mul_zero_dbladd": 2, "mul_zero_dbladd_inverse": 1, "outer_h_measure_reset_z_swap": 1},
     }
 
     return {
@@ -341,6 +436,10 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "x2": int(x2),
         "y2": int(y2),
         "counter_policy": policy.as_dict(),
+        "production_source_sha256": _production_source_sha256(),
+        "eea_steps_json_sha256": (
+            _sha256_file(Path(args.eea_steps_json)) if args.eea_steps_json else None
+        ),
         "qiskit_width_report": width,
         "eea_meta": eea_meta,
         "block_summaries": {
@@ -355,6 +454,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             "square_zero_dbladd": int(blocks["square_zero_dbladd"].get("ccx", 0)),
             "eea_algorithm3_main_loop": int(_counter(eea_meta.get("algorithm3_ops_loaded", {})).get("ccx", 0)),
             "eea_forward_shared": int(eea_forward.get("ccx", 0)),
+            "eea_inverse_shared": int(eea_inverse.get("ccx", 0)),
             "squ_minus": int(derived["squ_minus"].get("ccx", 0)),
             "idiv_fig15": int(derived["idiv_fig15"].get("ccx", 0)),
             "imul_fig15": int(derived["imul_fig15"].get("ccx", 0)),

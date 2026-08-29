@@ -124,15 +124,13 @@ except ImportError:  # Formula/test mode can still build X/CX/CCX circuits witho
             return g
 
 
-_rho = 2.0 + math.sqrt(3.0)
-_lambda_eea = _rho ** (1.0 / 3.0)
-# Revised Appendix A.1: lambda=(2+sqrt(3))^(1/3), c=1/log2(lambda).
-C_EEA = 1.0 / math.log2(_lambda_eea)
-# Appendix A.2 defines eta=((4*sqrt(3)-3)/13)*lambda^2 and
-# delta=-log_lambda(eta).  Compute the constant from that exact expression
-# rather than using the rounded decimal printed in the manuscript.
-_active_window_eta = ((4.0 * math.sqrt(3.0) - 3.0) / 13.0) * (_lambda_eea ** 2)
-ACTIVE_WINDOW_DELTA = -math.log(_active_window_eta) / math.log(_lambda_eea)
+# Revised universal four-phase EEA growth constants (Appendix A.1).
+# One unit of weighted quotient cost grows the continuant by at least lambda.
+EEA_BASE = 2.0 + math.sqrt(3.0)
+EEA_LAMBDA = EEA_BASE ** (1.0 / 3.0)
+C_EEA = 1.0 / math.log2(EEA_LAMBDA)
+# Refined finite-prefix correction used by the revised active-window proof.
+DELTA_EEA = -math.log(((4.0 * math.sqrt(3.0) - 3.0) / 13.0) * (EEA_LAMBDA ** 2), EEA_LAMBDA)
 
 def paper_len_width(n: int) -> int:
     """Width of l_t, l_q and l_r' with the unary/sign-free endpoint unitary.
@@ -148,24 +146,41 @@ def paper_len_width(n: int) -> int:
 
 
 def paper_shift_width(n: int) -> int:
-    """Width of l_s with the unary/sign-free endpoint unitary.
-
-    The same width is sufficient for all length registers once zero is tested
-    as equality to the all-ones encoding rather than by a sign/MSB bit.
-    """
+    """Base paper width of the circular shift pointer l_s."""
     return paper_len_width(n)
 
 
-N_CONFIG = {
-    64: {"len_width": paper_len_width(64), "shift_width": paper_shift_width(64), "T_max": 4 * math.ceil(C_EEA * 64)},
-    128: {"len_width": paper_len_width(128), "shift_width": paper_shift_width(128), "T_max": 4 * math.ceil(C_EEA * 128)},
-    160: {"len_width": paper_len_width(160), "shift_width": paper_shift_width(160), "T_max": 4 * math.ceil(C_EEA * 160)},
-    192: {"len_width": paper_len_width(192), "shift_width": paper_shift_width(192), "T_max": 4 * math.ceil(C_EEA * 192)},
-    224: {"len_width": paper_len_width(224), "shift_width": paper_shift_width(224), "T_max": 4 * math.ceil(C_EEA * 224)},
-    256: {"len_width": paper_len_width(256), "shift_width": paper_shift_width(256), "T_max": 4 * math.ceil(C_EEA * 256)},
-    384: {"len_width": paper_len_width(384), "shift_width": paper_shift_width(384), "T_max": 4 * math.ceil(C_EEA * 384)},
-    512: {"len_width": paper_len_width(512), "shift_width": paper_shift_width(512), "T_max": 4 * math.ceil(C_EEA * 512)},
-}
+def terminal_safe_shift_width(n: int, T_max: Optional[int] = None) -> int:
+    """Width of the low shift word when one borrowed epoch bit is available.
+
+    ``l_s`` retains the paper width whenever the fixed-horizon padding fits in
+    the two-word counter formed by ``l_s`` and one borrowed clean auxiliary
+    qubit.  The auxiliary is used only as a terminal-padding epoch bit and is
+    reversibly folded back into ``l_s`` before the EEA interface is exposed.
+    A low-word bit is added only for finite-size edge cases where even this
+    two-word representation would wrap.
+    """
+    if n <= 0:
+        raise ValueError("n must be positive")
+    if T_max is None:
+        T_max = 4 * math.ceil(C_EEA * n)
+    max_padding = max(0, int(T_max) - 4 * int(n))
+    width = paper_shift_width(n)
+    while max_padding >= (1 << (width + 1)):
+        width += 1
+    return width
+
+
+def _n_config_entry(n: int) -> dict:
+    T_max = 4 * math.ceil(C_EEA * n)
+    return {
+        "len_width": paper_len_width(n),
+        "shift_width": terminal_safe_shift_width(n, T_max),
+        "T_max": T_max,
+    }
+
+
+N_CONFIG = {n: _n_config_entry(n) for n in (64, 128, 160, 192, 224, 256, 384, 512)}
 
 PRIMITIVE_OPS = {"ccx", "cx", "x", "h", "z", "cz", "measure", "reset"}
 _INST_COUNT_CACHE: dict[tuple, Counter] = {}
@@ -189,9 +204,37 @@ MEASUREMENT_UNCOMPUTE = False
 
 
 def set_measurement_uncompute(enabled: bool) -> None:
+    """Select coherent or measurement-assisted unary-AND cleanup.
+
+    Circuit factories in several modules are memoized and depend on this mode.
+    Invalidate every loaded LRU cache when the mode changes; otherwise a dynamic
+    MBU definition can be reused in the literal unitary inverse (or vice versa).
+    """
     global MEASUREMENT_UNCOMPUTE
-    MEASUREMENT_UNCOMPUTE = bool(enabled)
+    enabled = bool(enabled)
+    changed = enabled != bool(MEASUREMENT_UNCOMPUTE)
+    MEASUREMENT_UNCOMPUTE = enabled
     _INST_COUNT_CACHE.clear()
+    if not changed:
+        return
+    import sys
+    # Clear this module first without calling another module's wrapper, which
+    # would recurse back here.
+    clear = globals().get("clear_gate_construction_caches")
+    if callable(clear):
+        clear()
+    for module_name in (
+        "eea_circuit_s835_fastdual",
+        "eea_circuit_s835_lowaux",
+        "under1000_eea_shared_s835_fastdual_wrapped",
+    ):
+        module = sys.modules.get(module_name)
+        if module is None:
+            continue
+        for obj in tuple(vars(module).values()):
+            cache_clear = getattr(obj, "cache_clear", None)
+            if callable(cache_clear):
+                cache_clear()
 
 
 def _block_circuit(*regs, name: str) -> QuantumCircuit:
@@ -202,10 +245,18 @@ def _block_circuit(*regs, name: str) -> QuantumCircuit:
 
 
 def _finalize_block(qc: QuantumCircuit):
-    # Dynamic blocks contain measurements and classically conditioned Clifford
-    # corrections, but no control-flow operations; they can be packed as an
-    # Instruction with clbits.  Pure helper blocks remain Gates.
-    return qc.to_instruction() if getattr(qc, "num_clbits", 0) else qc.to_gate()
+    """Return a reusable helper while preserving dynamic control flow exactly.
+
+    Pure reversible helpers are packed as :class:`~qiskit.circuit.Gate` objects.
+    Dynamic helpers are kept as ``QuantumCircuit`` objects and composed directly
+    by :func:`_append_with_optional_clbits`.  This avoids rebuilding a dynamic
+    definition through ``to_instruction()`` and therefore preserves the exact
+    measurement-bit identities and ``IfElseOp`` feed-forward structure in
+    Qiskit 2.x.
+    """
+    if getattr(qc, "num_clbits", 0):
+        return qc
+    return qc.to_gate()
 
 
 def _active_measure_bit(qc: QuantumCircuit):
@@ -215,18 +266,22 @@ def _active_measure_bit(qc: QuantumCircuit):
 
 
 def _conditional_z(qc: QuantumCircuit, mbit, q: Qubit) -> None:
-    # Use a real classically conditioned gate instead of a resource placeholder.
-    # This keeps the circuit dynamic while avoiding a control-flow IfElseOp, so
-    # recursive counting and composition remain lightweight.
-    op = ZGate().to_mutable()
-    op.condition = (mbit, 1)
-    qc.append(op, [q], [])
+    """Apply the feed-forward Z correction iff the measured bit is one.
+
+    Qiskit 2.x removed the legacy ``Instruction.condition`` execution model in
+    favour of explicit control flow.  Using ``if_test`` ensures that the
+    condition is part of the circuit IR and survives composition, conversion to
+    an Instruction, lowering, and serialization.  The bundled mini circuit
+    model implements the same context-manager interface for offline tests.
+    """
+    with qc.if_test((mbit, True)):
+        qc.z(q)
 
 
 def _conditional_cz(qc: QuantumCircuit, mbit, a: Qubit, b: Qubit) -> None:
-    op = CZGate().to_mutable()
-    op.condition = (mbit, 1)
-    qc.append(op, [a, b], [])
+    """Apply the measurement-dependent CZ correction using explicit control flow."""
+    with qc.if_test((mbit, True)):
+        qc.cz(a, b)
 
 
 def _mb_uncompute_and(qc: QuantumCircuit, a: Qubit, b: Qubit, target: Qubit) -> None:
@@ -510,76 +565,6 @@ def dec_mod2n_1ctrl(qc: QuantumCircuit, ctrl: Qubit, reg: Sequence[Qubit], anc: 
     qc.cx(ctrl, reg[0])
 
 
-def _toggle_eq_const_under_ctrl_generic(
-    qc: QuantumCircuit,
-    reg: Sequence[Qubit],
-    value: int,
-    ctrl: Qubit,
-    flag: Qubit,
-    eq: Qubit,
-    pool: Sequence[Qubit],
-) -> None:
-    """flag ^= ctrl & [reg == value], restoring ``eq`` and ``reg``."""
-    compute_eq_const(qc, reg, value, eq, pool)
-    qc.ccx(ctrl, eq, flag)
-    compute_eq_const(qc, reg, value, eq, pool)
-
-
-def inc_offset_mod_m_1ctrl(
-    qc: QuantumCircuit,
-    ctrl: Qubit,
-    reg: Sequence[Qubit],
-    modulus: int,
-    scratch: Sequence[Qubit],
-) -> None:
-    """Increment a truth-minus-one circular pointer modulo ``modulus``.
-
-    Encoded zero is the all-ones word, while positive pointer ``j`` is encoded
-    as ``j-1``.  This keeps the paper's 9-bit ``ell_s`` register sufficient for
-    the 259-lane Work2 register at n=256, including terminal padding.
-    """
-    reg = list(reg); scratch = list(scratch)
-    w = len(reg); mask = (1 << w) - 1
-    if not (1 <= modulus <= mask):
-        raise ValueError(f"modulus {modulus} is not representable by {w}-bit truth-minus-one pointer")
-    if len(scratch) < max(w - 1, w):
-        raise ValueError("insufficient scratch for circular pointer increment")
-    inc_mod2n_1ctrl(qc, ctrl, reg, scratch[:max(0, w - 1)])
-    wrap, eq = scratch[0], scratch[1]
-    pool = scratch[2:]
-    _toggle_eq_const_under_ctrl_generic(qc, reg, modulus - 1, ctrl, wrap, eq, pool)
-    delta = (modulus - 1) ^ mask
-    for i, q in enumerate(reg):
-        if (delta >> i) & 1:
-            qc.cx(wrap, q)
-    _toggle_eq_const_under_ctrl_generic(qc, reg, mask, ctrl, wrap, eq, pool)
-
-
-def dec_offset_mod_m_1ctrl(
-    qc: QuantumCircuit,
-    ctrl: Qubit,
-    reg: Sequence[Qubit],
-    modulus: int,
-    scratch: Sequence[Qubit],
-) -> None:
-    """Inverse of :func:`inc_offset_mod_m_1ctrl`."""
-    reg = list(reg); scratch = list(scratch)
-    w = len(reg); mask = (1 << w) - 1
-    if not (1 <= modulus <= mask):
-        raise ValueError(f"modulus {modulus} is not representable by {w}-bit truth-minus-one pointer")
-    if len(scratch) < max(w - 1, w):
-        raise ValueError("insufficient scratch for circular pointer decrement")
-    dec_mod2n_1ctrl(qc, ctrl, reg, scratch[:max(0, w - 1)])
-    wrap, eq = scratch[0], scratch[1]
-    pool = scratch[2:]
-    _toggle_eq_const_under_ctrl_generic(qc, reg, mask - 1, ctrl, wrap, eq, pool)
-    delta = (mask - 1) ^ (modulus - 2)
-    for i, q in enumerate(reg):
-        if (delta >> i) & 1:
-            qc.cx(wrap, q)
-    _toggle_eq_const_under_ctrl_generic(qc, reg, modulus - 2, ctrl, wrap, eq, pool)
-
-
 def mcx_vchain(qc: QuantumCircuit, ctrls: Sequence[Qubit], target: Qubit, ancillas: Sequence[Qubit]) -> None:
     """Multi-controlled X using a clean v-chain.  All ancillas are restored."""
     ctrls = list(ctrls)
@@ -656,29 +641,6 @@ def controlled_rotate_right_by_two(qc: QuantumCircuit, ctrl: Qubit, reg: Sequenc
         pivot = cycle[0]
         for j in cycle[1:]:
             cswap_toffoli(qc, ctrl, r[pivot], r[j])
-
-
-def controlled_rotate_left_by_two(qc: QuantumCircuit, ctrl: Qubit, reg: Sequence[Qubit]) -> None:
-    """Literal inverse of :func:`controlled_rotate_right_by_two`."""
-    r = list(reg)
-    m = len(r)
-    if m <= 2:
-        return
-    seen = [False] * m
-    for start in range(m):
-        if seen[start]:
-            continue
-        cycle: list[int] = []
-        j = start
-        while not seen[j]:
-            seen[j] = True
-            cycle.append(j)
-            j = (j + 2) % m
-        if len(cycle) <= 1:
-            continue
-        # Reverse the transposition order used by the right rotation.
-        for i in range(len(cycle) - 1, 0, -1):
-            cswap_toffoli(qc, ctrl, r[cycle[0]], r[cycle[i]])
 
 
 def const_minus_inplace(qc: QuantumCircuit, reg: Sequence[Qubit], const: int, scratch: Sequence[Qubit]) -> None:
@@ -974,39 +936,39 @@ def _controlled_toffoli(qc: QuantumCircuit, ctrl: Qubit, a: Qubit, b: Qubit, tar
     mcx_vchain(qc, [ctrl, a, b], target, pool)
 
 
-def controlled_maj(qc: QuantumCircuit, ctrl: Qubit, addend: Qubit, target: Qubit, carry: Qubit, pool: Sequence[Qubit]) -> None:
-    """Figure 11 controlled MAJ cell.
+def controlled_maj(qc: QuantumCircuit, ctrl: Qubit, a: Qubit, b: Qubit, c: Qubit, pool: Sequence[Qubit]) -> None:
+    """Controlled MAJ cell from paper Figure 11(a).
 
-    The CNOT skeleton is deliberately left uncontrolled.  Only the carry
-    update is location-controlled; matched MAJ/UMA passes cancel the skeleton
-    outside the selected interval.
+    The two CNOTs are intentionally unconditional. Only the carry-updating
+    Toffoli receives the location control; the matching UMA/UMA-dagger pass
+    cancels the CNOT skeleton on an inactive lane.
     """
-    qc.cx(carry, target)
-    qc.cx(carry, addend)
-    _controlled_toffoli(qc, ctrl, target, addend, carry, pool)
+    qc.cx(c, a)
+    qc.cx(c, b)
+    _controlled_toffoli(qc, ctrl, a, b, c, pool)
 
 
-def controlled_uma(qc: QuantumCircuit, ctrl: Qubit, addend: Qubit, target: Qubit, carry: Qubit, pool: Sequence[Qubit]) -> None:
-    """Figure 11 controlled UMA cell, including controlled sum writing."""
-    _controlled_toffoli(qc, ctrl, target, addend, carry, pool)
-    qc.ccx(ctrl, addend, target)
-    qc.cx(carry, addend)
-    qc.cx(carry, target)
+def controlled_uma(qc: QuantumCircuit, ctrl: Qubit, a: Qubit, b: Qubit, c: Qubit, pool: Sequence[Qubit]) -> None:
+    """Controlled UMA cell from paper Figure 11(b)."""
+    _controlled_toffoli(qc, ctrl, a, b, c, pool)
+    qc.ccx(ctrl, b, a)
+    qc.cx(c, b)
+    qc.cx(c, a)
 
 
-def controlled_maj_inv(qc: QuantumCircuit, ctrl: Qubit, addend: Qubit, target: Qubit, carry: Qubit, pool: Sequence[Qubit]) -> None:
-    """Literal inverse of :func:`controlled_maj`."""
-    _controlled_toffoli(qc, ctrl, target, addend, carry, pool)
-    qc.cx(carry, addend)
-    qc.cx(carry, target)
+def controlled_maj_inv(qc: QuantumCircuit, ctrl: Qubit, a: Qubit, b: Qubit, c: Qubit, pool: Sequence[Qubit]) -> None:
+    """Exact inverse of Figure 11(a)."""
+    _controlled_toffoli(qc, ctrl, a, b, c, pool)
+    qc.cx(c, b)
+    qc.cx(c, a)
 
 
-def controlled_uma_inv(qc: QuantumCircuit, ctrl: Qubit, addend: Qubit, target: Qubit, carry: Qubit, pool: Sequence[Qubit]) -> None:
-    """Literal inverse of :func:`controlled_uma`."""
-    qc.cx(carry, target)
-    qc.cx(carry, addend)
-    qc.ccx(ctrl, addend, target)
-    _controlled_toffoli(qc, ctrl, target, addend, carry, pool)
+def controlled_uma_inv(qc: QuantumCircuit, ctrl: Qubit, a: Qubit, b: Qubit, c: Qubit, pool: Sequence[Qubit]) -> None:
+    """Exact inverse of Figure 11(b)."""
+    qc.cx(c, a)
+    qc.cx(c, b)
+    qc.ccx(ctrl, b, a)
+    _controlled_toffoli(qc, ctrl, a, b, c, pool)
 
 
 def _apply_cell(
@@ -1020,13 +982,13 @@ def _apply_cell(
     pool: Sequence[Qubit],
 ) -> None:
     if mode == "add" and pass_kind == "first":
-        controlled_maj(qc, ctrl, addend, target, carry, pool)
+        controlled_maj(qc, ctrl, target, addend, carry, pool)
     elif mode == "add" and pass_kind == "second":
-        controlled_uma(qc, ctrl, addend, target, carry, pool)
+        controlled_uma(qc, ctrl, target, addend, carry, pool)
     elif mode == "sub" and pass_kind == "first":
-        controlled_uma_inv(qc, ctrl, addend, target, carry, pool)
+        controlled_uma_inv(qc, ctrl, target, addend, carry, pool)
     elif mode == "sub" and pass_kind == "second":
-        controlled_maj_inv(qc, ctrl, addend, target, carry, pool)
+        controlled_maj_inv(qc, ctrl, target, addend, carry, pool)
     else:
         raise ValueError("bad arithmetic cell mode/pass")
 
@@ -1040,44 +1002,32 @@ def pre_shift_gate(*, work_size: int, shift_width: int, name: str = "PRE_SHIFT_N
     l_s = QuantumRegister(shift_width, "l_s")
     Scratch = QuantumRegister(shift_width + 4, "Scratch")
     qc = _block_circuit(Phase1, Phase2, Work2, l_s, Scratch, name=name)
+
     phase1_is0 = Scratch[0]
     both = Scratch[1]
-    ptr_scratch = list(Scratch[2:]) + [Scratch[0], Scratch[1]]
+    chain = list(Scratch[2:2 + max(0, shift_width - 1)])
 
-    qc.x(Phase1[0]); qc.cx(Phase1[0], phase1_is0); qc.x(Phase1[0])
+    qc.x(Phase1[0])
+    qc.cx(Phase1[0], phase1_is0)
+    qc.x(Phase1[0])
+
+    # one-position left shift of Work2 controlled by Phase1=0
     for i in range(work_size - 1):
         cswap_toffoli(qc, phase1_is0, Work2[i], Work2[i + 1])
-    inc_offset_mod_m_1ctrl(qc, phase1_is0, list(l_s), work_size, ptr_scratch)
+    inc_mod2n_1ctrl(qc, phase1_is0, list(l_s), chain)
 
+    # if Phase2=1, additionally right-shift by two and l_s -= 2.
+    # The two-position shift is implemented as one controlled permutation
+    # using cycle decomposition, not as two adjacent one-position shifts.
     qc.ccx(phase1_is0, Phase2[0], both)
     controlled_rotate_right_by_two(qc, both, list(Work2))
-    dec_offset_mod_m_1ctrl(qc, both, list(l_s), work_size, ptr_scratch)
-    dec_offset_mod_m_1ctrl(qc, both, list(l_s), work_size, ptr_scratch)
+    dec_mod2n_1ctrl(qc, both, list(l_s), chain)
+    dec_mod2n_1ctrl(qc, both, list(l_s), chain)
     qc.ccx(phase1_is0, Phase2[0], both)
-    qc.x(Phase1[0]); qc.cx(Phase1[0], phase1_is0); qc.x(Phase1[0])
-    return _finalize_block(qc)
 
-
-@lru_cache(maxsize=None)
-def pre_shift_inverse_gate(*, work_size: int, shift_width: int, name: str = "PRE_SHIFT_INV") -> Gate:
-    Phase1 = QuantumRegister(1, "Phase1")
-    Phase2 = QuantumRegister(1, "Phase2")
-    Work2 = QuantumRegister(work_size, "Work2")
-    l_s = QuantumRegister(shift_width, "l_s")
-    Scratch = QuantumRegister(shift_width + 4, "Scratch")
-    qc = _block_circuit(Phase1, Phase2, Work2, l_s, Scratch, name=name)
-    phase1_is0 = Scratch[0]; both = Scratch[1]
-    ptr_scratch = list(Scratch[2:]) + [Scratch[0], Scratch[1]]
-    qc.x(Phase1[0]); qc.cx(Phase1[0], phase1_is0); qc.x(Phase1[0])
-    qc.ccx(phase1_is0, Phase2[0], both)
-    inc_offset_mod_m_1ctrl(qc, both, list(l_s), work_size, ptr_scratch)
-    inc_offset_mod_m_1ctrl(qc, both, list(l_s), work_size, ptr_scratch)
-    controlled_rotate_left_by_two(qc, both, list(Work2))
-    qc.ccx(phase1_is0, Phase2[0], both)
-    dec_offset_mod_m_1ctrl(qc, phase1_is0, list(l_s), work_size, ptr_scratch)
-    for i in reversed(range(work_size - 1)):
-        cswap_toffoli(qc, phase1_is0, Work2[i], Work2[i + 1])
-    qc.x(Phase1[0]); qc.cx(Phase1[0], phase1_is0); qc.x(Phase1[0])
+    qc.x(Phase1[0])
+    qc.cx(Phase1[0], phase1_is0)
+    qc.x(Phase1[0])
     return _finalize_block(qc)
 
 
@@ -1089,79 +1039,67 @@ def post_shift_gate(*, work_size: int, shift_width: int, name: str = "POST_SHIFT
     l_s = QuantumRegister(shift_width, "l_s")
     Scratch = QuantumRegister(shift_width + 4, "Scratch")
     qc = _block_circuit(Phase1, Phase2, Work2, l_s, Scratch, name=name)
+
     both = Scratch[0]
-    ptr_scratch = list(Scratch[1:]) + [Scratch[0]]
+    chain = list(Scratch[1:1 + max(0, shift_width - 1)])
+
     for i in range(work_size - 1):
         cswap_toffoli(qc, Phase1[0], Work2[i], Work2[i + 1])
-    inc_offset_mod_m_1ctrl(qc, Phase1[0], list(l_s), work_size, ptr_scratch)
+    inc_mod2n_1ctrl(qc, Phase1[0], list(l_s), chain)
+
     qc.ccx(Phase1[0], Phase2[0], both)
     controlled_rotate_right_by_two(qc, both, list(Work2))
-    dec_offset_mod_m_1ctrl(qc, both, list(l_s), work_size, ptr_scratch)
-    dec_offset_mod_m_1ctrl(qc, both, list(l_s), work_size, ptr_scratch)
+    dec_mod2n_1ctrl(qc, both, list(l_s), chain)
+    dec_mod2n_1ctrl(qc, both, list(l_s), chain)
     qc.ccx(Phase1[0], Phase2[0], both)
     return _finalize_block(qc)
 
 
 @lru_cache(maxsize=None)
-def post_shift_inverse_gate(*, work_size: int, shift_width: int, name: str = "POST_SHIFT_INV") -> Gate:
-    Phase1 = QuantumRegister(1, "Phase1")
-    Phase2 = QuantumRegister(1, "Phase2")
-    Work2 = QuantumRegister(work_size, "Work2")
-    l_s = QuantumRegister(shift_width, "l_s")
-    Scratch = QuantumRegister(shift_width + 4, "Scratch")
-    qc = _block_circuit(Phase1, Phase2, Work2, l_s, Scratch, name=name)
-    both = Scratch[0]
-    ptr_scratch = list(Scratch[1:]) + [Scratch[0]]
-    qc.ccx(Phase1[0], Phase2[0], both)
-    inc_offset_mod_m_1ctrl(qc, both, list(l_s), work_size, ptr_scratch)
-    inc_offset_mod_m_1ctrl(qc, both, list(l_s), work_size, ptr_scratch)
-    controlled_rotate_left_by_two(qc, both, list(Work2))
-    qc.ccx(Phase1[0], Phase2[0], both)
-    dec_offset_mod_m_1ctrl(qc, Phase1[0], list(l_s), work_size, ptr_scratch)
-    for i in reversed(range(work_size - 1)):
-        cswap_toffoli(qc, Phase1[0], Work2[i], Work2[i + 1])
-    return _finalize_block(qc)
+def phase_update_gate(*, len_width: int, shift_width: int, include_shift_epoch: bool = False,
+                      name: str = "PHASE_UPDATE_NEW") -> Gate:
+    """Algorithm-3 phase update with exact encoded-zero predicates.
 
-
-@lru_cache(maxsize=None)
-def phase_update_gate(*, len_width: int, shift_width: int, name: str = "PHASE_UPDATE_NEW") -> Gate:
-    """Algorithm-3 phase-update block using all-ones zero tests.
-
-    The length registers still store truth-minus-one, so actual length zero is
-    encoded as the all-ones word.  The older signed endpoint unitary used the
-    MSB as a zero detector and therefore needed extra sign headroom.  With the
-    unary/sign-free endpoint unitary we compute the zero flags explicitly as
-    equality-to-all-ones, allowing all length registers to use the +1 width.
+    When ``include_shift_epoch`` is true, the physical epoch qubit stores the
+    complement of the high bit of the terminal-padding counter.  Consequently
+    encoded ell_s=0 is ``l_s=all-ones`` together with ``ShiftEpoch=0``.  The
+    epoch is included in both the compute and uncompute of the zero predicate,
+    preventing a low-word wrap during padding from re-entering the arithmetic.
     """
     Phase1 = QuantumRegister(1, "Phase1")
     Phase2 = QuantumRegister(1, "Phase2")
     Sign = QuantumRegister(1, "Sign")
-    l_q = QuantumRegister(len_width, "l_q")      # stores ell_q - 1
-    l_rp = QuantumRegister(len_width, "l_rp")    # stores ell_rp - 1
-    l_s = QuantumRegister(shift_width, "l_s")    # stores ell_s - 1
-    eq_scratch = max(0, max(len_width, shift_width) - 2)
+    l_q = QuantumRegister(len_width, "l_q")
+    l_rp = QuantumRegister(len_width, "l_rp")
+    l_s = QuantumRegister(shift_width, "l_s")
+    ShiftEpoch = QuantumRegister(1, "ShiftEpoch") if include_shift_epoch else None
+    shift_test_width = shift_width + (1 if include_shift_epoch else 0)
+    eq_scratch = max(0, max(len_width, shift_test_width) - 2)
     Scratch = QuantumRegister(5 + eq_scratch, "Scratch")
-    qc = _block_circuit(Phase1, Phase2, Sign, l_q, l_rp, l_s, Scratch, name=name)
+    regs = [Phase1, Phase2, Sign, l_q, l_rp, l_s]
+    if ShiftEpoch is not None:
+        regs.append(ShiftEpoch)
+    regs.append(Scratch)
+    qc = _block_circuit(*regs, name=name)
 
-    z_lq = Scratch[0]
-    z_lrp = Scratch[1]
-    z_ls = Scratch[2]
-    cond = Scratch[3]
-    tmp = Scratch[4]
+    z_lq, z_lrp, z_ls, cond, tmp = Scratch[:5]
     pool = list(Scratch[5:])
 
     def toggle_zero(reg: Sequence[Qubit], flag: Qubit) -> None:
-        # Encoded zero is all ones.  Registers are unchanged by this test, so
-        # calling the same test again uncomputes the flag.
         mcx_vchain(qc, list(reg), flag, pool)
+
+    def toggle_shift_zero() -> None:
+        if ShiftEpoch is None:
+            toggle_zero(l_s, z_ls)
+        else:
+            qc.x(ShiftEpoch[0])
+            toggle_zero([*l_s, ShiftEpoch[0]], z_ls)
+            qc.x(ShiftEpoch[0])
 
     toggle_zero(l_q, z_lq)
     toggle_zero(l_rp, z_lrp)
-    toggle_zero(l_s, z_ls)
+    toggle_shift_zero()
 
-    # if ell_q = 0 and ell_rp > 0 then
-    #     Phase2 <- Phase2 xor Sign xor Phase1
-    #     Sign   <- Sign xor Phase2
     qc.x(z_lrp)
     qc.ccx(z_lq, z_lrp, cond)
     qc.x(z_lrp)
@@ -1171,56 +1109,105 @@ def phase_update_gate(*, len_width: int, shift_width: int, name: str = "PHASE_UP
     qc.ccx(cond, tmp, Phase2[0])
     qc.cx(Phase1[0], tmp)
     qc.cx(Sign[0], tmp)
-
     qc.ccx(cond, Phase2[0], Sign[0])
 
     qc.x(z_lrp)
     qc.ccx(z_lq, z_lrp, cond)
     qc.x(z_lrp)
 
-    # if ell_s = 0 then Phase1 ^= 1 and Phase2 ^= 1
     qc.cx(z_ls, Phase1[0])
     qc.cx(z_ls, Phase2[0])
 
-    toggle_zero(l_s, z_ls)
+    toggle_shift_zero()
     toggle_zero(l_rp, z_lrp)
     toggle_zero(l_q, z_lq)
     return _finalize_block(qc)
 
 
 @lru_cache(maxsize=None)
-def phase_update_inverse_gate(*, len_width: int, shift_width: int, name: str = "PHASE_UPDATE_INV") -> Gate:
-    """Literal inverse of :func:`phase_update_gate`."""
+def phase_update_inverse_gate(*, len_width: int, shift_width: int,
+                              include_shift_epoch: bool = False,
+                              name: str = "PHASE_UPDATE_NEW_INV"):
+    """Explicit measurement-assisted inverse of :func:`phase_update_gate`.
+
+    The zero predicates are reconstructed from the unchanged length metadata.
+    The phase bits are then undone in exact reverse order, after which the same
+    self-inverse dynamic MCX networks clear the predicate flags.  This retains
+    measurement-based AND uncomputation and therefore has the same Toffoli cost
+    model as the forward paper block.
+    """
     Phase1 = QuantumRegister(1, "Phase1")
     Phase2 = QuantumRegister(1, "Phase2")
     Sign = QuantumRegister(1, "Sign")
     l_q = QuantumRegister(len_width, "l_q")
     l_rp = QuantumRegister(len_width, "l_rp")
     l_s = QuantumRegister(shift_width, "l_s")
-    eq_scratch = max(0, max(len_width, shift_width) - 2)
+    ShiftEpoch = QuantumRegister(1, "ShiftEpoch") if include_shift_epoch else None
+    shift_test_width = shift_width + (1 if include_shift_epoch else 0)
+    eq_scratch = max(0, max(len_width, shift_test_width) - 2)
     Scratch = QuantumRegister(5 + eq_scratch, "Scratch")
-    qc = _block_circuit(Phase1, Phase2, Sign, l_q, l_rp, l_s, Scratch, name=name)
-    z_lq,z_lrp,z_ls,cond,tmp=Scratch[0],Scratch[1],Scratch[2],Scratch[3],Scratch[4]
-    pool=list(Scratch[5:])
-    def toggle_zero(reg, flag): mcx_vchain(qc, list(reg), flag, pool)
-    toggle_zero(l_q,z_lq); toggle_zero(l_rp,z_lrp); toggle_zero(l_s,z_ls)
-    # Undo the ell_s=0 phase flips first.
-    qc.cx(z_ls, Phase2[0]); qc.cx(z_ls, Phase1[0])
-    qc.x(z_lrp); qc.ccx(z_lq,z_lrp,cond); qc.x(z_lrp)
-    # Undo Sign using the current (post-forward-update) Phase2.
+    regs = [Phase1, Phase2, Sign, l_q, l_rp, l_s]
+    if ShiftEpoch is not None:
+        regs.append(ShiftEpoch)
+    regs.append(Scratch)
+    qc = _block_circuit(*regs, name=name)
+
+    z_lq, z_lrp, z_ls, cond, tmp = Scratch[:5]
+    pool = list(Scratch[5:])
+
+    def toggle_zero(reg: Sequence[Qubit], flag: Qubit) -> None:
+        mcx_vchain(qc, list(reg), flag, pool)
+
+    def toggle_shift_zero() -> None:
+        if ShiftEpoch is None:
+            toggle_zero(l_s, z_ls)
+        else:
+            qc.x(ShiftEpoch[0])
+            toggle_zero([*l_s, ShiftEpoch[0]], z_ls)
+            qc.x(ShiftEpoch[0])
+
+    # Recreate all three zero predicates at the reverse boundary.
+    toggle_zero(l_q, z_lq)
+    toggle_zero(l_rp, z_lrp)
+    toggle_shift_zero()
+
+    # Undo the final z_ls-controlled phase transition first.
+    qc.cx(z_ls, Phase2[0])
+    qc.cx(z_ls, Phase1[0])
+
+    # Recreate cond = z_lq AND NOT(z_lrp).
+    qc.x(z_lrp)
+    qc.ccx(z_lq, z_lrp, cond)
+    qc.x(z_lrp)
+
+    # Undo Sign ^= cond & Phase2, then undo the earlier Phase2 update using
+    # the now-restored pre-Sign value.
     qc.ccx(cond, Phase2[0], Sign[0])
-    # Sign and Phase1 are now their pre-forward values, so rebuild the same tmp.
-    qc.cx(Sign[0],tmp); qc.cx(Phase1[0],tmp)
-    qc.ccx(cond,tmp,Phase2[0])
-    qc.cx(Phase1[0],tmp); qc.cx(Sign[0],tmp)
-    qc.x(z_lrp); qc.ccx(z_lq,z_lrp,cond); qc.x(z_lrp)
-    toggle_zero(l_s,z_ls); toggle_zero(l_rp,z_lrp); toggle_zero(l_q,z_lq)
+    qc.cx(Sign[0], tmp)
+    qc.cx(Phase1[0], tmp)
+    qc.ccx(cond, tmp, Phase2[0])
+    qc.cx(Phase1[0], tmp)
+    qc.cx(Sign[0], tmp)
+
+    qc.x(z_lrp)
+    qc.ccx(z_lq, z_lrp, cond)
+    qc.x(z_lrp)
+
+    toggle_shift_zero()
+    toggle_zero(l_rp, z_lrp)
+    toggle_zero(l_q, z_lq)
     return _finalize_block(qc)
 
 
 # Location-controlled Swap / Add / Sub using unary iteration
 @lru_cache(maxsize=None)
 def lc_swap_unary_gate(*, k: int, K: int, len_width: int, name: str = "LC_SWAP_UNARY") -> Gate:
+    """Paper Figure 9 location-controlled quotient-bit swap.
+
+    Algorithm 3 merges the Phase-2 and Phase-3 swaps because both act on the
+    same one-based Work1 position ``J = ell_t + ell_q + 1``.  The only
+    phase-dependent operation is the update of ``ell_q`` after this block.
+    """
     if k > K:
         raise ValueError("need k <= K")
     M = K - k + 1
@@ -1236,11 +1223,11 @@ def lc_swap_unary_gate(*, k: int, K: int, len_width: int, name: str = "LC_SWAP_U
     qc = _block_circuit(Ctrl, Sign, Work1, l_t, l_q, Scratch, name=name)
 
     carry = Scratch[0]
-    z = Scratch[1]
     const_scratch = list(Scratch[: len_width + 2])
     path = list(Scratch[len_width + 2:])
 
-    # l_q temporarily stores raw J = (ell_t-1)+(ell_q-1)+3 = ell_t+ell_q+1.
+    # Truth-minus-one encoding gives
+    #   (ell_t-1) + (ell_q-1) + 3 = ell_t + ell_q + 1.
     qc.append(cuccaro_add_mod_2n_no_z_gate(len_width, name="ADD_lt_to_lq"), list(l_t) + list(l_q) + [carry])
     add_const_mod_2n(qc, l_q, 3, const_scratch)
 
@@ -1257,83 +1244,183 @@ def lc_swap_unary_gate(*, k: int, K: int, len_width: int, name: str = "LC_SWAP_U
 
 @lru_cache(maxsize=None)
 def lc_interval_addsub_unary_gate(
-    *, n: int, k: int, K: int, len_width: int, shift_width: int,
-    mode: Literal["add", "sub"], sign_update: bool,
-    target: Literal["work1", "work2"], name: str,
-    guard_lrp_width: int = 0,
+    *,
+    n: int,
+    k: int,
+    K: int,
+    len_width: int,
+    shift_width: int,
+    mode: Literal["add", "sub"],
+    sign_update: bool,
+    target: Literal["work1", "work2"],
+    name: str,
 ) -> Gate:
-    """Endpoint-complete interval arithmetic for the general implementation."""
-    if k > K: raise ValueError("need k <= K")
-    M=K-k+1; depth=unary_depth(M); endpoint_width=max(len_width,shift_width)
-    scratch_size=max((endpoint_width+2)+2*depth+5, max(0,guard_lrp_width-1)+3)
-    Ctrl=QuantumRegister(1,"Ctrl"); Sign=QuantumRegister(1,"Sign")
-    Work1=QuantumRegister(M,"Work1"); Work2=QuantumRegister(M,"Work2")
-    l_t=QuantumRegister(len_width,"l_t"); l_q=QuantumRegister(len_width,"l_q"); l_s=QuantumRegister(shift_width,"l_s")
-    l_rp_guard=QuantumRegister(guard_lrp_width,"l_rp_guard") if guard_lrp_width else None
-    Scratch=QuantumRegister(scratch_size,"Scratch")
-    regs=[Ctrl,Sign,Work1,Work2,l_t,l_q,l_s]
-    if l_rp_guard is not None: regs.append(l_rp_guard)
-    regs.append(Scratch); qc=_block_circuit(*regs,name=name)
-    carry=Scratch[0]; acc=Scratch[2]
-    const_scratch=list(Scratch[:endpoint_width+2])
-    anc_a=list(Scratch[endpoint_width+2:endpoint_width+2+depth])
-    anc_b=list(Scratch[endpoint_width+2+depth:endpoint_width+2+2*depth])
-    pool=list(Scratch[endpoint_width+2+2*depth:])
-    qc.append(cuccaro_add_mod_2n_no_z_gate(len_width,name="ADD_lt_to_lq"),list(l_t)+list(l_q)+[carry])
-    add_const_mod_2n(qc,l_q,4,const_scratch); const_minus_inplace(qc,l_s,n+2,const_scratch)
-    def qpair(j):
-        idx=j-k
-        if target=="work1": return Work2[idx],Work1[idx]
-        if target=="work2": return Work1[idx],Work2[idx]
-        raise ValueError("bad target")
-    def first(j,rj,lj):
-        a,t=qpair(j); qc.cx(rj,acc); _apply_cell(qc,mode,"first",acc,a,t,carry,pool); qc.cx(lj,acc)
-    dual_unary_iteration(qc,index_a=l_s,index_b=l_q,labels=list(range(k,K+1)),ctrl_a=Ctrl[0],ctrl_b=Ctrl[0],
-                         ancillas_a=anc_a,ancillas_b=anc_b,leaf_fn=first,order="dec")
+    """Two-endpoint interval Add/Sub for r-side arithmetic.
+
+    Endpoints are prepared exactly as PDF Eq. (13), with the Section-4.2
+    truth-minus-one encoding:
+        L = ell_t + ell_q + 2 -> l_q <- l_q + l_t + 4,
+        R = n + 3 - ell_s     -> l_s <- n + 2 - l_s.
+    The dual unary scan exposes r_j = Ctrl[R=j] and lambda_j = Ctrl[L=j].
+    """
+    if k > K:
+        raise ValueError("need k <= K")
+    M = K - k + 1
+    depth = unary_depth(M)
+    endpoint_width = max(len_width, shift_width)
+    scratch_size = (endpoint_width + 2) + 2 * depth + 5
+
+    Ctrl = QuantumRegister(1, "Ctrl")
+    Sign = QuantumRegister(1, "Sign")
+    Work1 = QuantumRegister(M, "Work1")
+    Work2 = QuantumRegister(M, "Work2")
+    l_t = QuantumRegister(len_width, "l_t")
+    l_q = QuantumRegister(len_width, "l_q")
+    l_s = QuantumRegister(shift_width, "l_s")
+    Scratch = QuantumRegister(scratch_size, "Scratch")
+    qc = _block_circuit(Ctrl, Sign, Work1, Work2, l_t, l_q, l_s, Scratch, name=name)
+
+    carry = Scratch[0]
+    z = Scratch[1]
+    acc = Scratch[2]
+    const_scratch = list(Scratch[: endpoint_width + 2])
+    anc_a = list(Scratch[endpoint_width + 2: endpoint_width + 2 + depth])
+    anc_b = list(Scratch[endpoint_width + 2 + depth: endpoint_width + 2 + 2 * depth])
+    pool = list(Scratch[endpoint_width + 2 + 2 * depth:])
+    if len(pool) < 1:
+        raise ValueError("internal pool too small")
+
+    # Prepare raw L=(ell_t-1)+(ell_q-1)+4 and raw R=n+2-(ell_s-1).
+    qc.append(cuccaro_add_mod_2n_no_z_gate(len_width, name="ADD_lt_to_lq"), list(l_t) + list(l_q) + [carry])
+    add_const_mod_2n(qc, l_q, 4, const_scratch)
+    const_minus_inplace(qc, l_s, n + 2, const_scratch)
+
+    def qpair(j: int) -> tuple[Qubit, Qubit]:
+        idx = j - k
+        if target == "work1":
+            addend = Work2[idx]
+            tgt = Work1[idx]
+        elif target == "work2":
+            addend = Work1[idx]
+            tgt = Work2[idx]
+        else:
+            raise ValueError("target must be 'work1' or 'work2'")
+        return addend, tgt
+
+    # First pass: j = K, K-1, ..., k.  Toggle at R before the cell and at L after.
+    def leaf_first(j: int, rj: Qubit, lj: Qubit) -> None:
+        addend, tgt = qpair(j)
+        qc.cx(rj, acc)
+        _apply_cell(qc, mode, "first", acc, addend, tgt, carry, pool)
+        qc.cx(lj, acc)
+
+    dual_unary_iteration(qc, index_a=l_s, index_b=l_q, labels=list(range(k, K + 1)),
+                         ctrl_a=Ctrl[0], ctrl_b=Ctrl[0], ancillas_a=anc_a,
+                         ancillas_b=anc_b, leaf_fn=leaf_first, order="dec")
+
     if sign_update:
-        qc.cx(carry,Sign[0])
-        if l_rp_guard is not None:
-            mcx_vchain(qc,[carry]+list(l_rp_guard),Sign[0],list(Scratch))
-    def second(j,rj,lj):
-        a,t=qpair(j); qc.cx(lj,acc); _apply_cell(qc,mode,"second",acc,a,t,carry,pool); qc.cx(rj,acc)
-    dual_unary_iteration(qc,index_a=l_s,index_b=l_q,labels=list(range(k,K+1)),ctrl_a=Ctrl[0],ctrl_b=Ctrl[0],
-                         ancillas_a=anc_a,ancillas_b=anc_b,leaf_fn=second,order="inc")
-    const_minus_inplace(qc,l_s,n+2,const_scratch); sub_const_mod_2n(qc,l_q,4,const_scratch)
-    qc.append(cuccaro_sub_mod_2n_no_z_gate(len_width,name="SUB_lt_from_lq"),list(l_t)+list(l_q)+[carry])
+        qc.cx(carry, Sign[0])
+
+    # Second pass: j = k, k+1, ..., K.  Toggle at L before and at R after.
+    def leaf_second(j: int, rj: Qubit, lj: Qubit) -> None:
+        addend, tgt = qpair(j)
+        qc.cx(lj, acc)
+        _apply_cell(qc, mode, "second", acc, addend, tgt, carry, pool)
+        qc.cx(rj, acc)
+
+    dual_unary_iteration(qc, index_a=l_s, index_b=l_q, labels=list(range(k, K + 1)),
+                         ctrl_a=Ctrl[0], ctrl_b=Ctrl[0], ancillas_a=anc_a,
+                         ancillas_b=anc_b, leaf_fn=leaf_second, order="inc")
+
+    # Restore endpoint registers.
+    const_minus_inplace(qc, l_s, n + 2, const_scratch)
+    sub_const_mod_2n(qc, l_q, 4, const_scratch)
+    qc.append(cuccaro_sub_mod_2n_no_z_gate(len_width, name="SUB_lt_from_lq"), list(l_t) + list(l_q) + [carry])
     return _finalize_block(qc)
 
 
 @lru_cache(maxsize=None)
 def lc_prefix_addsub_unary_gate(
-    *, k: int, K: int, len_width: int,
-    mode: Literal["add", "sub"], sign_update: bool,
-    target: Literal["work1", "work2"], name: str,
+    *,
+    k: int,
+    K: int,
+    len_width: int,
+    mode: Literal["add", "sub"],
+    sign_update: bool,
+    target: Literal["work1", "work2"],
+    name: str,
 ) -> Gate:
-    """Little-endian t-side prefix arithmetic."""
-    if k>K: raise ValueError("need k <= K")
-    M=K-k+1; depth=unary_depth(M); scratch_size=(len_width+2)+depth+4
-    Ctrl=QuantumRegister(1,"Ctrl"); Sign=QuantumRegister(1,"Sign")
-    Work1=QuantumRegister(M,"Work1"); Work2=QuantumRegister(M,"Work2"); l_t=QuantumRegister(len_width,"l_t")
-    Scratch=QuantumRegister(scratch_size,"Scratch"); qc=_block_circuit(Ctrl,Sign,Work1,Work2,l_t,Scratch,name=name)
-    carry=Scratch[0]; acc=Scratch[1]; const_scratch=list(Scratch[:len_width+2])
-    path=list(Scratch[len_width+2:len_width+2+depth]); pool=list(Scratch[len_width+2+depth:])
-    add_const_mod_2n(qc,l_t,2,const_scratch)
-    def qpair(j):
-        idx=j-k
-        if target=="work1": return Work2[idx],Work1[idx]
-        if target=="work2": return Work1[idx],Work2[idx]
-        raise ValueError("bad target")
-    qc.cx(Ctrl[0],acc)
-    def first(j,ej):
-        a,t=qpair(j); _apply_cell(qc,mode,"first",acc,a,t,carry,pool); qc.cx(ej,acc)
-    unary_iteration(qc,index_reg=l_t,labels=list(range(k,K+1)),ctrl=Ctrl[0],ancillas=path,leaf_fn=first,order="inc")
-    if sign_update: qc.cx(carry,Sign[0])
-    def second(j,ej):
-        a,t=qpair(j); qc.cx(ej,acc); _apply_cell(qc,mode,"second",acc,a,t,carry,pool)
-        if j==k: qc.cx(Ctrl[0],acc)
-    unary_iteration(qc,index_reg=l_t,labels=list(range(k,K+1)),ctrl=Ctrl[0],ancillas=path,leaf_fn=second,order="dec")
-    sub_const_mod_2n(qc,l_t,2,const_scratch)
+    """One-sided Add/Sub for the t-side arithmetic.
+
+    The physical prefix endpoint is ``R = ell_t + 1 + Phase2``. During
+    Phase 3 this is the ordinary ``ell_t+1`` coefficient prefix. During
+    Phase 4 the circular Work2 representation exposes one additional high
+    lane, so that lane must participate in the comparison/addition. With
+    the truth-minus-one encoding, the temporary endpoint is therefore
+    ``l_t += 2 + Phase2``.
+    """
+    if k > K:
+        raise ValueError("need k <= K")
+    M = K - k + 1
+    depth = unary_depth(M)
+    scratch_size = (len_width + 2) + depth + 4
+
+    Ctrl = QuantumRegister(1, "Ctrl")
+    Phase2 = QuantumRegister(1, "Phase2")
+    Sign = QuantumRegister(1, "Sign")
+    Work1 = QuantumRegister(M, "Work1")
+    Work2 = QuantumRegister(M, "Work2")
+    l_t = QuantumRegister(len_width, "l_t")
+    Scratch = QuantumRegister(scratch_size, "Scratch")
+    qc = _block_circuit(Ctrl, Phase2, Sign, Work1, Work2, l_t, Scratch, name=name)
+
+    carry = Scratch[0]
+    acc = Scratch[1]
+    const_scratch = list(Scratch[: len_width + 2])
+    path = list(Scratch[len_width + 2: len_width + 2 + depth])
+    pool = list(Scratch[len_width + 2 + depth:])
+    if len(pool) < 1:
+        raise ValueError("internal pool too small")
+
+    add_const_mod_2n(qc, l_t, 2, const_scratch)
+    inc_mod2n_1ctrl(qc, Phase2[0], list(l_t), list(Scratch[: max(0, len_width - 1)]))
+
+    def qpair(j: int) -> tuple[Qubit, Qubit]:
+        idx = j - k
+        if target == "work1":
+            return Work2[idx], Work1[idx]
+        if target == "work2":
+            return Work1[idx], Work2[idx]
+        raise ValueError("target must be 'work1' or 'work2'")
+
+    # t and t' are little-endian at the left edge. Carry propagates from k
+    # upward to R; the reverse pass scans back from R to k.
+    qc.cx(Ctrl[0], acc)
+
+    def leaf_first(j: int, ej: Qubit) -> None:
+        addend, tgt = qpair(j)
+        _apply_cell(qc, mode, "first", acc, addend, tgt, carry, pool)
+        qc.cx(ej, acc)
+
+    unary_iteration(qc, index_reg=l_t, labels=list(range(k, K + 1)), ctrl=Ctrl[0],
+                    ancillas=path, leaf_fn=leaf_first, order="inc")
+
+    if sign_update:
+        qc.cx(carry, Sign[0])
+
+    def leaf_second(j: int, ej: Qubit) -> None:
+        addend, tgt = qpair(j)
+        qc.cx(ej, acc)
+        _apply_cell(qc, mode, "second", acc, addend, tgt, carry, pool)
+
+    unary_iteration(qc, index_reg=l_t, labels=list(range(k, K + 1)), ctrl=Ctrl[0],
+                    ancillas=path, leaf_fn=leaf_second, order="dec")
+    qc.cx(Ctrl[0], acc)
+
+    dec_mod2n_1ctrl(qc, Phase2[0], list(l_t), list(Scratch[: max(0, len_width - 1)]))
+    sub_const_mod_2n(qc, l_t, 2, const_scratch)
     return _finalize_block(qc)
+
 
 
 # Unary length-update circuits
@@ -1359,7 +1446,10 @@ def _upper_zero_map(
     a_tmp = scratch[depth + 1]
 
     def compute_a(bctrl: Qubit, u: Qubit) -> None:
-        qc.ccx(bctrl, u, a_tmp)
+        _and_with_index_bit(qc, bctrl, u, a_tmp, 1)
+
+    def uncompute_a(bctrl: Qubit, u: Qubit) -> None:
+        _uncompute_and_with_index_bit(qc, bctrl, u, a_tmp, 1)
 
     def use_not_a_with_gnext(a: Qubit, gnext: Qubit, target: Qubit) -> None:
         qc.x(a)
@@ -1378,8 +1468,12 @@ def _upper_zero_map(
         if j < K:
             use_not_a_with_gnext(a_tmp, dirty[idx + 1], dirty[idx])
         else:
-            use_not_a_cnot(a_tmp, dirty[idx])
-        compute_a(bctrl, bits[idx])
+            # Base z_K is Ctrl & NOT(a_K); this makes every z_j zero when
+            # the enclosing length-update block is inactive.
+            qc.x(a_tmp)
+            qc.ccx(ctrl, a_tmp, dirty[idx])
+            qc.x(a_tmp)
+        uncompute_a(bctrl, bits[idx])
 
     range_scan_leq(qc, boundary_reg=boundary_B, k=k, K=K, ctrl=ctrl,
                    range_acc=range_acc, ancillas=path, leaf_fn=leaf_forward, order="inc")
@@ -1391,7 +1485,7 @@ def _upper_zero_map(
         idx = j - k
         compute_a(bctrl, bits[idx])
         use_not_a_with_gnext(a_tmp, dirty[idx + 1], dirty[idx])
-        compute_a(bctrl, bits[idx])
+        uncompute_a(bctrl, bits[idx])
 
     range_scan_leq(qc, boundary_reg=boundary_B, k=k, K=K, ctrl=ctrl,
                    range_acc=range_acc, ancillas=path, leaf_fn=leaf_reverse, order="dec")
@@ -1419,7 +1513,10 @@ def _lower_zero_map(
     a_tmp = scratch[depth + 1]
 
     def compute_a(bctrl: Qubit, u: Qubit) -> None:
-        qc.ccx(bctrl, u, a_tmp)
+        _and_with_index_bit(qc, bctrl, u, a_tmp, 1)
+
+    def uncompute_a(bctrl: Qubit, u: Qubit) -> None:
+        _uncompute_and_with_index_bit(qc, bctrl, u, a_tmp, 1)
 
     def use_not_a_with_gprev(a: Qubit, gprev: Qubit, target: Qubit) -> None:
         qc.x(a)
@@ -1438,8 +1535,12 @@ def _lower_zero_map(
         if j > k:
             use_not_a_with_gprev(a_tmp, dirty[idx - 1], dirty[idx])
         else:
-            use_not_a_cnot(a_tmp, dirty[idx])
-        compute_a(bctrl, bits[idx])
+            # Base y_k is Ctrl & NOT(a_k), so the dirty map is inactive
+            # when Ctrl=0 without adding Ctrl to every constant write.
+            qc.x(a_tmp)
+            qc.ccx(ctrl, a_tmp, dirty[idx])
+            qc.x(a_tmp)
+        uncompute_a(bctrl, bits[idx])
 
     range_scan_geq(qc, boundary_reg=boundary_A, k=k, K=K, ctrl=ctrl,
                    range_acc=range_acc, ancillas=path, leaf_fn=leaf_forward, order="dec")
@@ -1451,7 +1552,7 @@ def _lower_zero_map(
         idx = j - k
         compute_a(bctrl, bits[idx])
         use_not_a_with_gprev(a_tmp, dirty[idx - 1], dirty[idx])
-        compute_a(bctrl, bits[idx])
+        uncompute_a(bctrl, bits[idx])
 
     range_scan_geq(qc, boundary_reg=boundary_A, k=k, K=K, ctrl=ctrl,
                    range_acc=range_acc, ancillas=path, leaf_fn=leaf_reverse, order="inc")
@@ -1474,9 +1575,10 @@ def highest_position_xor_write(
     Eq. (28) writes the truth length.  Because Section 4.2 stores truth-minus
     one, this routine writes ``highest_position - 1``; if no valid nonzero bit
     exists and the external Ctrl is 1, it writes ``-1 mod 2^w`` to encode truth
-    length 0.  All constant writes are additionally controlled by Ctrl, so when
-    the enclosing length-update block is inactive the net operation is exactly
-    the identity.
+    length 0.  The seed is controlled by Ctrl.  The paired constant writes are
+    controlled only by the borrowed dirty qubits, exactly as in Figures 12--13;
+    the zero-map itself includes Ctrl, so the two dirty-controlled writes cancel
+    when the enclosing block is inactive.
     """
     if len(bits) != K - k + 1 or len(dirty) != K - k + 1:
         raise ValueError("bits/dirty length does not match active window")
@@ -1492,10 +1594,10 @@ def highest_position_xor_write(
         for j in range(K, k, -1):
             # Enc(j) xor Enc(j-1) = (j-1) xor (j-2).
             xor_const_into_reg_controls(qc, target_len, ((j - 1) ^ (j - 2)) & mask,
-                                        ctrls=[ctrl, dirty[j - k]], scratch=scratch)
+                                        ctrls=[dirty[j - k]], scratch=scratch)
         # Enc(k) xor Enc(0), where Enc(0)=-1=mask.
         xor_const_into_reg_controls(qc, target_len, ((k - 1) ^ mask) & mask,
-                                    ctrls=[ctrl, dirty[0]], scratch=scratch)
+                                    ctrls=[dirty[0]], scratch=scratch)
 
     # Controlled Enc(K) seed.
     xor_const_into_reg_controls(qc, target_len, (K - 1) & mask, ctrls=[ctrl], scratch=scratch)
@@ -1527,8 +1629,10 @@ def right_length_xor_write(
 
     If the lowest valid nonzero right-side position is m, the truth length is
     n+4-m and the stored value is n+3-m.  The no-nonzero truth length 0 is
-    encoded by -1.  Constant writes are controlled by the external Ctrl so the
-    inactive length-update block is exactly identity.
+    encoded by -1.  The zero-map includes the external Ctrl, while the paired
+    borrowed-qubit constant writes use only their dirty controls; therefore the
+    inactive block is exactly the identity without promoting those CNOT writes
+    to Toffolis.
     """
     if len(bits) != K - k + 1 or len(dirty) != K - k + 1:
         raise ValueError("bits/dirty length does not match active window")
@@ -1541,16 +1645,16 @@ def right_length_xor_write(
     mask = (1 << len(target_len)) - 1
 
     def val(pos: int) -> int:
-        # Enc(n+4-pos) = n+3-pos.
+        # Enc(n+4-pos) = n+3-pos for one-based physical work positions.
         return (n + 3 - pos) & mask
 
     def apply_dirty_writes() -> None:
         for j in range(k, K):
             xor_const_into_reg_controls(qc, target_len, val(j) ^ val(j + 1),
-                                        ctrls=[ctrl, dirty[j - k]], scratch=scratch)
+                                        ctrls=[dirty[j - k]], scratch=scratch)
         # Enc(length at K) xor Enc(0), where Enc(0)=-1=mask.
         xor_const_into_reg_controls(qc, target_len, val(K) ^ mask,
-                                    ctrls=[ctrl, dirty[K - k]], scratch=scratch)
+                                    ctrls=[dirty[K - k]], scratch=scratch)
 
     xor_const_into_reg_controls(qc, target_len, val(k), ctrls=[ctrl], scratch=scratch)
     apply_dirty_writes()
@@ -1630,7 +1734,11 @@ def swap_work_and_len_unary_gate(
 ) -> Gate:
     work_size = n + 3
     depth4 = unary_depth(K4 - k4 + 1)
-    depth5 = unary_depth(K5 - k5 + 1)
+    # The right-length unary decoder needs the boundary successor label in
+    # addition to the arithmetic support [k5,K5]. This does not enlarge the
+    # data-active window; it completes the telescoping endpoint decode.
+    K5_decode = min(K5 + 1, n + 3)
+    depth5 = unary_depth(K5_decode - k5 + 1)
     scratch4 = (len_width + 2) + depth4 + 2
     scratch5 = (len_width + 2) + depth5 + 2
 
@@ -1650,8 +1758,8 @@ def swap_work_and_len_unary_gate(
     _append_with_optional_clbits(qc, gate_lt, [Ctrl[0]] + list(Work1[k4 - 1:K4]) + list(Work2[k4 - 1:K4])
                                 + list(l_t) + list(l_rp) + list(Scratch4))
 
-    gate_lrp = len_update_lrp_unary_gate(n=n, k=k5, K=K5, len_width=len_width)
-    _append_with_optional_clbits(qc, gate_lrp, [Ctrl[0]] + list(Work1[k5 - 1:K5]) + list(Work2[k5 - 1:K5])
+    gate_lrp = len_update_lrp_unary_gate(n=n, k=k5, K=K5_decode, len_width=len_width)
+    _append_with_optional_clbits(qc, gate_lrp, [Ctrl[0]] + list(Work1[k5 - 1:K5_decode]) + list(Work2[k5 - 1:K5_decode])
                                 + list(l_t) + list(l_rp) + list(Scratch5))
     return _finalize_block(qc)
 
@@ -1670,15 +1778,18 @@ def Nmax_steps(n: int) -> int:
 
 
 def active_windows(n: int, T: int) -> dict[str, tuple[int, int]]:  # type: ignore[override]
-    """Revised-paper Appendix A.2 active windows.
+    """Revised Appendix-A.2 step-dependent active-window bounds.
 
-    The implementation intentionally follows the supplied manuscript formulas
-    exactly, including the delta improvement, rather than widening the windows.
+    This function exposes the analytic bounds used for resource analysis.  The
+    executable production path may deliberately choose endpoint-complete
+    conservative supports via ``eea_circuit_s835_fastdual._step_windows``; the
+    two concepts are kept separate so correctness tests never silently rely on
+    an unverified narrow support.
     """
-    if n <= 0 or T <= 0:
-        raise ValueError("n and T must be positive")
+    if T < 1:
+        raise ValueError("Algorithm-3 step index T is 1-based; need T >= 1")
     c = C_EEA
-    delta = ACTIVE_WINDOW_DELTA
+    delta = DELTA_EEA
 
     k1 = max(_ceil_safe((T - n - 1 - 4.0 * delta) / (4.0 * c - 1.0)), 1) + 2
     K1 = n + 3
@@ -1686,26 +1797,24 @@ def active_windows(n: int, T: int) -> dict[str, tuple[int, int]]:  # type: ignor
     k2 = max(_ceil_safe((T - 3.0 * (n + 1) - 4.0 * delta) / (4.0 * c - 3.0)), 1) + 1
     K2 = min(_floor_safe(T / 2.0) + 2, n + 2)
 
-    K3 = min(_ceil_safe(T / 4.0) + 1, n + 1)
+    K3 = min(_floor_safe(T / 4.0) + 2, n + 1)
 
     k4 = max(_ceil_safe((T - 4.0 * (n + 1) - 4.0 * delta) / (4.0 * c - 4.0)), 1)
-    K4 = min(_floor_safe(T / 4.0 + 3.0), n + 3)
+    K4 = min(_floor_safe(T / 4.0) + 3, n + 2)
 
-    k5 = max(_ceil_safe((T - 4.0 * delta) / (4.0 * c)), 1)
-    K5 = min(_floor_safe(T / 4.0 + 4.0), n + 3)
+    k5 = max(_ceil_safe((T - 4.0 * delta) / (4.0 * c)), 1) + 2
+    K5 = n + 3
 
+    # Empty analytic windows can occur on step families that are inactive at T.
+    # Keep their endpoints within the physical register so construction tools
+    # can inspect them without creating a malformed slice.
     out = {
-        "r_addsub": (k1, K1),
-        "swap": (k2, K2),
-        "t_addsub": (1, K3),
-        "len_update_lt": (k4, K4),
-        "len_update_lrp": (k5, K5),
+        "r_addsub": (max(1, min(k1, n + 3)), K1),
+        "swap": (max(1, min(k2, n + 2)), max(1, K2)),
+        "t_addsub": (1, max(1, K3)),
+        "len_update_lt": (max(1, min(k4, n + 3)), max(1, K4)),
+        "len_update_lrp": (max(1, min(k5, n + 3)), max(1, K5)),
     }
-    for name, (a, b) in out.items():
-        if a > b:
-            raise ValueError(f"empty active window for {name} at n={n}, T={T}: [{a},{b}]")
-        if a < 1 or b > n + 3:
-            raise ValueError(f"active window out of Work range for {name} at n={n}, T={T}: [{a},{b}]")
     return out
 
 
@@ -1790,7 +1899,8 @@ def swap_work_and_len_unary_shared_gate(
     """Full Work SWAP plus the two serial length updates using one shared scratch pool."""
     work_size = n + 3
     scratch4 = _len_update_scratch_size(len_width, K4 - k4 + 1)
-    scratch5 = _len_update_scratch_size(len_width, K5 - k5 + 1)
+    K5_decode = min(K5 + 1, n + 3)
+    scratch5 = _len_update_scratch_size(len_width, K5_decode - k5 + 1)
     scratch_size = max(scratch4, scratch5)
 
     Ctrl = QuantumRegister(1, "Ctrl")
@@ -1808,8 +1918,8 @@ def swap_work_and_len_unary_shared_gate(
     _append_with_optional_clbits(qc, gate_lt, [Ctrl[0]] + list(Work1[k4 - 1:K4]) + list(Work2[k4 - 1:K4])
                                 + list(l_t) + list(l_rp) + list(Scratch[:scratch4]))
 
-    gate_lrp = len_update_lrp_unary_gate(n=n, k=k5, K=K5, len_width=len_width)
-    _append_with_optional_clbits(qc, gate_lrp, [Ctrl[0]] + list(Work1[k5 - 1:K5]) + list(Work2[k5 - 1:K5])
+    gate_lrp = len_update_lrp_unary_gate(n=n, k=k5, K=K5_decode, len_width=len_width)
+    _append_with_optional_clbits(qc, gate_lrp, [Ctrl[0]] + list(Work1[k5 - 1:K5_decode]) + list(Work2[k5 - 1:K5_decode])
                                 + list(l_t) + list(l_rp) + list(Scratch[:scratch5]))
     return _finalize_block(qc)
 
@@ -1880,11 +1990,10 @@ def append_one_step_T(  # type: ignore[override]
     # R-side subtraction: controlled by Phase1=0.
     _make_condition_into(qc, [(Phase1[0], 0)], ctrl, pool)
     rsub = lc_interval_addsub_unary_gate(n=n, k=k1, K=K1, len_width=len_width, shift_width=shift_width,
-                                         mode="sub", sign_update=True, target="work1", name="R_SUB_UNARY",
-                                         guard_lrp_width=len_width)
+                                         mode="sub", sign_update=True, target="work1", name="R_SUB_UNARY")
     _append_with_shared_aux(qc, rsub,
                             [ctrl, Sign[0]] + list(Work1[k1 - 1:K1]) + list(Work2[k1 - 1:K1])
-                            + list(l_t) + list(l_q) + list(l_s) + list(l_rp), Aux)
+                            + list(l_t) + list(l_q) + list(l_s), Aux)
     _make_condition_into(qc, [(Phase1[0], 0)], ctrl, pool)
 
     # Algorithm 3: if Phase1=0 and Phase2=1 then Sign ^= 1.
@@ -1903,9 +2012,10 @@ def append_one_step_T(  # type: ignore[override]
     _make_condition_into(qc, [(Phase1[0], 0), (tmp, 0)], ctrl, pool)
     qc.ccx(Phase2[0], Sign[0], tmp)
 
-    # In Phase 2 the quotient length is incremented before selecting the newly
-    # created least-significant q lane.  In Phase 3 it is decremented only after
-    # the selected quotient bit has been consumed.
+    # Phase 2 increases ell_q before selecting the newly inserted lane;
+    # Phase 3 selects the existing least-significant lane and decreases ell_q
+    # afterwards.  The shared Figure-9 selector therefore remains exactly
+    # J=ell_t+ell_q+1.
     _make_condition_into(qc, [(Phase1[0], 0), (Phase2[0], 1)], ctrl, pool)
     inc_mod2n_1ctrl(qc, ctrl, list(l_q), list(Aux[: max(0, len_width - 1)]))
     _make_condition_into(qc, [(Phase1[0], 0), (Phase2[0], 1)], ctrl, pool)
@@ -1929,7 +2039,7 @@ def append_one_step_T(  # type: ignore[override]
     tsub = lc_prefix_addsub_unary_gate(k=k3, K=K3, len_width=len_width,
                                        mode="sub", sign_update=False, target="work2", name="T_SUB_UNARY")
     _append_with_shared_aux(qc, tsub,
-                            [ctrl, Sign[0]] + list(Work1[k3 - 1:K3]) + list(Work2[k3 - 1:K3])
+                            [ctrl, Phase2[0], Sign[0]] + list(Work1[k3 - 1:K3]) + list(Work2[k3 - 1:K3])
                             + list(l_t), Aux, reserved=1)
     _make_condition_into(qc, [(Phase1[0], 1), (tmp, 0)], ctrl, pool)
     _make_condition_into(qc, [(Phase2[0], 0), (Sign[0], 1)], tmp, pool)
@@ -1942,7 +2052,7 @@ def append_one_step_T(  # type: ignore[override]
     tadd = lc_prefix_addsub_unary_gate(k=k3, K=K3, len_width=len_width,
                                        mode="add", sign_update=True, target="work2", name="T_ADD_UNARY")
     _append_with_shared_aux(qc, tadd,
-                            [ctrl, Sign[0]] + list(Work1[k3 - 1:K3]) + list(Work2[k3 - 1:K3])
+                            [ctrl, Phase2[0], Sign[0]] + list(Work1[k3 - 1:K3]) + list(Work2[k3 - 1:K3])
                             + list(l_t), Aux)
     _make_condition_into(qc, [(Phase1[0], 1)], ctrl, pool)
 
@@ -1974,133 +2084,6 @@ def append_one_step_T(  # type: ignore[override]
         mcx_vchain(qc, list(l_q), z_lq, eq_pool)
 
 
-def _classical_expected_after_preprocessed_eea(p: int, x_used: int) -> tuple[int, int, int]:
-    """Return (exact_steps, tprime_mod_p, iteration_parity) for the paper's positive-t EEA.
-
-    This is the same reference recurrence used by test_eea_main.py: t_{i+1}=t_{i-1}+q_i t_i,
-    and one Euclidean quotient consumes 4*q.bit_length() Algorithm-3 steps.
-    """
-    r_prev, r = p, x_used
-    t_prev, t = 0, 1
-    exact_steps = 0
-    parity = 0
-    while r != 0:
-        q = r_prev // r
-        exact_steps += 4 * q.bit_length()
-        r_prev, r = r, r_prev - q * r
-        t_prev, t = t, t_prev + q * t
-        parity ^= 1
-    return exact_steps, t_prev % p, parity
-
-
-def _apply_xors_under_literals(
-    qc: QuantumCircuit,
-    *,
-    conditions: Sequence[tuple[Qubit, int]],
-    targets: Sequence[Qubit],
-    flag: Qubit,
-    scratch: Sequence[Qubit],
-) -> None:
-    """XOR a list of target qubits under literal controls, restoring the flag/scratch."""
-    targets = list(targets)
-    if not targets:
-        return
-    target_ids = {id(q) for q in targets}
-    overlap = [q for q, _ in conditions if id(q) in target_ids]
-    if overlap:
-        raise ValueError("literal-controlled XOR target overlaps a control qubit")
-    compute_control(qc, conditions, flag, scratch)
-    for target in targets:
-        qc.cx(flag, target)
-    compute_control(qc, conditions, flag, scratch)
-
-
-def _build_small_algorithm3_reference_circuit(
-    *,
-    n: int,
-    len_width: int,
-    shift_width: int,
-    T_max: int,
-    aux_size: Optional[int],
-) -> QuantumCircuit:
-    """Reference-correct Algorithm-3 endpoint map for small basis-state tests.
-
-    The uploaded regression test checks the externally visible state after the Algorithm-3
-    loop, not every transient layout in Figures 5--6.  For n <= 4, the preprocessed value
-    x_used is always below 2^(n-1).  Thus the input bits of x_used that are needed as
-    branch controls can be chosen outside the tested output slice Work2[0:n].  The circuit
-    then writes the mathematically correct EEA endpoint by reversible controlled XORs:
-    Work2[0:n] receives t', Iter is toggled once per Euclidean quotient, and l_rp is set
-    to encoded zero.  l_q and l_s are already initialized to encoded zero and are left
-    untouched; Aux and Ctrl are restored/left clean.
-    """
-    if T_max is None:
-        T_max = Nmax_steps(n)
-    regs = make_global_registers(n=n, len_width=len_width, shift_width=shift_width, T_max=T_max, aux_size=aux_size)
-    qc = QuantumCircuit(*regs, name="MODINV_STEPS_SMALL_REFERENCE")
-    (Phase1, Phase2, Iter, Sign, Ctrl, Work1, Work2, l_t, l_q, l_s, l_rp, Aux) = regs
-
-    if not (1 <= n <= 4):
-        raise ValueError("the small reference endpoint circuit is only valid for 1 <= n <= 4")
-    if len(Aux) < max(1, 2 * n):
-        raise ValueError(f"the small reference endpoint circuit needs at least {max(1, 2 * n)} Aux qubits")
-
-    flag = Aux[0]
-    scratch = list(Aux[1:])
-    len_zero = (1 << len_width) - 1
-
-    # The test sets n = p.bit_length(), so p ranges over n-bit positive integers.
-    p_min = 1 if n == 1 else (1 << (n - 1))
-    p_max = (1 << n) - 1
-
-    # x is stored in Work2[3:3+n] in big-endian order.  For n=4, Work2[3]
-    # overlaps the output field Work2[0:n], but preprocessing guarantees that bit
-    # is zero; the lower n-1 bits still distinguish every possible x_used.
-    x_control_bits = n if n <= 3 else n - 1
-    x_control_start = 3 + (n - x_control_bits)
-
-    for p_value in range(p_min, p_max + 1):
-        p_conditions = [(Work1[3 + j], (p_value >> (n - 1 - j)) & 1) for j in range(n)]
-        for x_used in range(1, p_value // 2 + 1):
-            if math.gcd(p_value, x_used) != 1:
-                continue
-            exact_steps, tprime, quotient_parity = _classical_expected_after_preprocessed_eea(p_value, x_used)
-            if T_max < exact_steps:
-                continue
-
-            x_conditions = [
-                (Work2[x_control_start + j], (x_used >> (x_control_bits - 1 - j)) & 1)
-                for j in range(x_control_bits)
-            ]
-            conditions = p_conditions + x_conditions
-
-            targets: list[Qubit] = []
-
-            # Work2[0:n] is read as little-endian t' by test_eea_main.py.
-            for bit in range(n):
-                if (tprime >> bit) & 1:
-                    targets.append(Work2[bit])
-
-            # Iter is toggled once per Euclidean quotient, matching the end-of-iteration
-            # SWAP/Len block in Algorithm 3.
-            if quotient_parity:
-                targets.append(Iter[0])
-
-            # l_rp must terminate at actual length 0, encoded as all ones.  The input
-            # value is bit_length(x_used)-1 under the paper's truth-minus-one convention.
-            lrp_initial = x_used.bit_length() - 1
-            lrp_delta = lrp_initial ^ len_zero
-            for bit in range(len_width):
-                if (lrp_delta >> bit) & 1:
-                    targets.append(l_rp[bit])
-
-            _apply_xors_under_literals(qc, conditions=conditions, targets=targets, flag=flag, scratch=scratch)
-
-    return qc
-
-
-_tiny_steps_builder = _build_small_algorithm3_reference_circuit
-
 
 def build_full_steps_circuit(n: int, len_width: int, shift_width: int,
                              T_max: Optional[int] = None,
@@ -2112,11 +2095,6 @@ def build_full_steps_circuit(n: int, len_width: int, shift_width: int,
     # and allow chunked construction of the Figure-5/Figure-6 step circuit.
     if T_max is None:
         T_max = Nmax_steps(n)
-
-    if 0 < n < 4:
-        return _tiny_steps_builder(
-            n=n, len_width=len_width, shift_width=shift_width, T_max=T_max, aux_size=aux_size
-        )
 
     _require_qiskit()
     if T_end is None:
@@ -2155,12 +2133,21 @@ def controlled_const_minus_le(
     const: int,
     scratch: Sequence[Qubit],
 ) -> None:
-    """Controlled little-endian affine map reg <- const - reg (mod 2^n)."""
-    n = len(reg_le)
-    if len(scratch) < n + 1:
-        raise ValueError(f"controlled_const_minus_le needs >= {n + 1} scratch qubits")
-    gate = const_minus_le_gate(n, const)
-    qc.append(gate.control(1), [ctrl] + list(reg_le) + list(scratch[: n + 1]))
+    """Controlled little-endian affine map ``reg <- const-reg (mod 2^n)``.
+
+    This is expanded explicitly instead of relying on ``Gate.control()``, which
+    can hide an unsupported multi-controlled version of the internal ripple
+    gates.  On the active branch, ``const-reg = ~reg + (const+1)``.
+    """
+    reg = list(reg_le); n = len(reg)
+    if len(scratch) < max(0, n - 1):
+        raise ValueError(f"controlled_const_minus_le needs >= {max(0,n-1)} scratch qubits")
+    for q in reg:
+        qc.cx(ctrl, q)
+    addend = (int(const) + 1) & ((1 << n) - 1)
+    for i in range(n):
+        if (addend >> i) & 1:
+            inc_mod2n_1ctrl(qc, ctrl, reg[i:], list(scratch[:max(0, n-i-1)]))
 
 
 def xor_gt_const_little_endian(
@@ -2809,15 +2796,9 @@ def _iter_circuit_items(circ: QuantumCircuit):
 
 
 def count_instruction_ops(inst: Instruction) -> Counter:
-    name = str(inst.name).lower()
-    # Qiskit canonicalizes self-inverse primitive daggers back to the primitive
-    # name.  Lightweight compatibility runtimes may retain an ``_dg`` suffix;
-    # normalize it here without treating it as an opaque operation.
-    if name.endswith("_dg") and name[:-3] in PRIMITIVE_OPS:
-        name = name[:-3]
-    if name in PRIMITIVE_OPS:
-        return Counter({name: 1})
-    if name == "if_else" and hasattr(inst, "blocks"):
+    if inst.name in PRIMITIVE_OPS:
+        return Counter({inst.name: 1})
+    if inst.name == "if_else" and hasattr(inst, "blocks"):
         total = Counter()
         for block in inst.blocks:
             for subinst, _qargs, _cargs in _iter_circuit_items(block):
@@ -2857,15 +2838,11 @@ def count_pdf_formula_one_step(n: int, T: int) -> Counter:
     d4 = max(0, K4 - k4)
     d5 = max(0, K5 - k5)
 
-    # Table 5 gives the cost of one block.  Algorithm 3 invokes two r-side
-    # blocks and two t-side blocks per step, plus one swap.  Each length-update
-    # block is present only when 4 divides T.  Shift and O(log n) endpoint
-    # arithmetic are intentionally outside this major-block formula.
-    ccx = 2 * 11 * d1 + 2 * d2 + 2 * 9 * d3
-    cx = 2 * 12 * d1 + 4 * d2 + 2 * 10 * d3
+    ccx = 14 * d1 + 2 * d2 + 12 * d3
+    cx = 8 * d1 + 4 * d2 + 4 * d3
     if T % 4 == 0:
-        ccx += 24 * d4 + 24 * d5
-        cx += 32 * d4 + 32 * d5
+        ccx += 12 * d4 + 12 * d5
+        cx += 16 * d4 + 16 * d5
     return Counter({"ccx": ccx, "cx": cx})
 
 
@@ -2892,7 +2869,7 @@ def _count_full_steps_recursive_streaming(
 
     This is not the Section-5 paper formula.  Each step is built with
     ``append_one_step_T`` and recursively walked down to X/CX/CCX.  We stream the
-    steps instead of materializing the entire fixed-schedule top-level circuit, which
+    steps instead of materializing the entire 1476-step top-level circuit, which
     keeps n=256 counting tractable while producing the same raw recursive count
     as a full top-level circuit without cross-gate cancellation/optimization.
     """
@@ -3086,7 +3063,9 @@ def count_full_circuit_ops(
 def get_n_config(n: int) -> dict:
     if n in N_CONFIG:
         return N_CONFIG[n].copy()
-    return {"len_width": paper_len_width(n), "shift_width": paper_shift_width(n), "T_max": Nmax_steps(n)}
+    T_max = Nmax_steps(n)
+    width = max(paper_len_width(n), terminal_safe_shift_width(n, T_max))
+    return {"len_width": width, "shift_width": width, "T_max": T_max}
 
 
 def run_for_n(
@@ -3127,310 +3106,13 @@ def run_for_n(
     )}
 
 
-# ---------------------------------------------------------------------------
-# Strict-test-compatible lookup builders for finite verification instances.
-# ---------------------------------------------------------------------------
-
-_build_full_steps_circuit_original = build_full_steps_circuit
-_build_modular_inversion_algorithm1_circuit_original = build_modular_inversion_algorithm1_circuit
-
-
-def _enc_len_for_lookup(actual_length: int, width: int) -> int:
-    return ((1 << width) - 1) if actual_length == 0 else ((actual_length - 1) % (1 << width))
-
-
-def _bits_of_int_le(value: int, width: int) -> list[int]:
-    value %= 1 << width
-    return [(value >> i) & 1 for i in range(width)]
-
-
-def _bits_of_int_be(value: int, width: int) -> list[int]:
-    value %= 1 << width
-    return [(value >> (width - 1 - i)) & 1 for i in range(width)]
-
-
-def _append_named_idle_blocks(qc: QuantumCircuit, qubit: Qubit) -> None:
-    names = [
-        "PRE_SHIFT", "R_SUB", "R_ADD", "LC_SWAP", "T_SUB", "T_ADD",
-        "POST_SHIFT", "PHASE_UPDATE", "SWAP_AND_LEN",
-    ]
-    for name in names:
-        q = QuantumRegister(1, "q")
-        idle = QuantumCircuit(q, name=f"{name}_IDLE")
-        qc.append(idle.to_gate(), [qubit])
-
-
-def _conditions_for_bits(qubits: Sequence[Qubit], values: Sequence[int]) -> list[tuple[Qubit, int]]:
-    return [(q, int(v) & 1) for q, v in zip(qubits, values)]
-
-
-def _toggle_targets_with_flag(qc: QuantumCircuit, targets: Sequence[Qubit], flag: Qubit) -> None:
-    seen: set[int] = set()
-    for q in targets:
-        ident = id(q)
-        if ident in seen:
-            continue
-        seen.add(ident)
-        qc.cx(flag, q)
-
-
-def _append_transition_by_conditions(
-    qc: QuantumCircuit,
-    *,
-    initial_conditions: Sequence[tuple[Qubit, int]],
-    final_conditions: Sequence[tuple[Qubit, int]],
-    delta_targets: Sequence[Qubit],
-    flag: Qubit,
-    scratch: Sequence[Qubit],
-) -> None:
-    # Toggle a clean flag on the source pattern, apply the bitwise delta, and
-    # toggle the flag back on the destination pattern.  This avoids relying on
-    # source controls after output bits that overlap the source have changed.
-    compute_control(qc, initial_conditions, flag, scratch)
-    _toggle_targets_with_flag(qc, delta_targets, flag)
-    compute_control(qc, final_conditions, flag, scratch)
-
-
-def _work2_initial_bits_for_value(n: int, x_value: int) -> list[int]:
-    bits = [0] * (n + 3)
-    be = _bits_of_int_be(x_value, n)
-    for j, b in enumerate(be):
-        bits[3 + j] = b
-    return bits
-
-
-def _work1_initial_bits_for_modulus(n: int, p_value: int) -> list[int]:
-    bits = [0] * (n + 3)
-    bits[0] = 1
-    be = _bits_of_int_be(p_value, n)
-    for j, b in enumerate(be):
-        bits[3 + j] = b
-    return bits
-
-
-def _append_algorithm3_endpoint_case(
-    qc: QuantumCircuit,
-    *,
-    n: int,
-    len_width: int,
-    shift_width: int,
-    p_value: int,
-    x_used: int,
-    exact_steps: int,
-    tprime: int,
-    quotient_parity: int,
-    regs: Sequence[QuantumRegister],
-) -> None:
-    Phase1, Phase2, Iter, Sign, Ctrl, Work1, Work2, l_t, l_q, l_s, l_rp, Aux = regs
-    flag = Aux[0]
-    scratch = list(Aux[1:])
-
-    w1_init = _work1_initial_bits_for_modulus(n, p_value)
-    w2_init = _work2_initial_bits_for_value(n, x_used)
-    lrp_init_value = x_used.bit_length() - 1
-    lrp_final_value = (1 << len_width) - 1
-    lq_zero = (1 << len_width) - 1
-    ls_zero = (1 << shift_width) - 1
-
-    initial_conditions: list[tuple[Qubit, int]] = []
-    initial_conditions += _conditions_for_bits(Work1, w1_init)
-    initial_conditions += _conditions_for_bits(Work2, w2_init)
-    initial_conditions += _conditions_for_bits(l_q, _bits_of_int_le(lq_zero, len_width))
-    initial_conditions += _conditions_for_bits(l_s, _bits_of_int_le(ls_zero, shift_width))
-    initial_conditions += _conditions_for_bits(l_rp, _bits_of_int_le(lrp_init_value, len_width))
-    initial_conditions += [(Phase1[0], 0), (Phase2[0], 0), (Sign[0], 0)]
-
-    final_work2 = list(w2_init)
-    for i, b in enumerate(_bits_of_int_le(tprime, n)):
-        final_work2[i] = b
-
-    final_conditions: list[tuple[Qubit, int]] = []
-    final_conditions += _conditions_for_bits(Work1, w1_init)
-    final_conditions += _conditions_for_bits(Work2, final_work2)
-    final_conditions += _conditions_for_bits(l_q, _bits_of_int_le(lq_zero, len_width))
-    final_conditions += _conditions_for_bits(l_s, _bits_of_int_le(ls_zero, shift_width))
-    final_conditions += _conditions_for_bits(l_rp, _bits_of_int_le(lrp_final_value, len_width))
-    final_conditions += [(Phase1[0], 0), (Phase2[0], 0), (Sign[0], 0)]
-
-    delta_targets: list[Qubit] = []
-    for i in range(n):
-        if w2_init[i] ^ final_work2[i]:
-            delta_targets.append(Work2[i])
-    for i, bit in enumerate(_bits_of_int_le(lrp_init_value ^ lrp_final_value, len_width)):
-        if bit:
-            delta_targets.append(l_rp[i])
-    if quotient_parity & 1:
-        delta_targets.append(Iter[0])
-
-    _append_transition_by_conditions(
-        qc,
-        initial_conditions=initial_conditions,
-        final_conditions=final_conditions,
-        delta_targets=delta_targets,
-        flag=flag,
-        scratch=scratch,
-    )
-
-
-_TABLE4_LOOKUP_ROWS = {
-    1:  {"work1": "100100101", "work2": "000011010", "ell_t": 1, "ell_q": 0, "ell_rp": 4, "ell_s": 1, "phase1": 0, "phase2": 0, "iter": 0, "sign": 0},
-    2:  {"work1": "100100101", "work2": "000110100", "ell_t": 1, "ell_q": 0, "ell_rp": 4, "ell_s": 2, "phase1": 0, "phase2": 1, "iter": 0, "sign": 0},
-    3:  {"work1": "101001011", "work2": "000011010", "ell_t": 1, "ell_q": 1, "ell_rp": 4, "ell_s": 1, "phase1": 0, "phase2": 1, "iter": 0, "sign": 0},
-    4:  {"work1": "101001011", "work2": "000001101", "ell_t": 1, "ell_q": 2, "ell_rp": 4, "ell_s": 0, "phase1": 1, "phase2": 0, "iter": 0, "sign": 0},
-    5:  {"work1": "101001011", "work2": "000011010", "ell_t": 1, "ell_q": 1, "ell_rp": 4, "ell_s": 1, "phase1": 1, "phase2": 0, "iter": 0, "sign": 0},
-    6:  {"work1": "100001011", "work2": "000110101", "ell_t": 1, "ell_q": 0, "ell_rp": 4, "ell_s": 2, "phase1": 1, "phase2": 1, "iter": 0, "sign": 1},
-    7:  {"work1": "100001011", "work2": "100011010", "ell_t": 1, "ell_q": 0, "ell_rp": 4, "ell_s": 1, "phase1": 1, "phase2": 1, "iter": 0, "sign": 0},
-    8:  {"work1": "010001101", "work2": "100001011", "ell_t": 2, "ell_q": 0, "ell_rp": 4, "ell_s": 0, "phase1": 0, "phase2": 0, "iter": 1, "sign": 0},
-    12: {"work1": "110001011", "work2": "010000010", "ell_t": 2, "ell_q": 0, "ell_rp": 2, "ell_s": 0, "phase1": 0, "phase2": 0, "iter": 0, "sign": 0},
-    16: {"work1": "110100011", "work2": "000001001", "ell_t": 2, "ell_q": 1, "ell_rp": 2, "ell_s": 2, "phase1": 0, "phase2": 1, "iter": 0, "sign": 0},
-    24: {"work1": "100010010", "work2": "110000001", "ell_t": 5, "ell_q": 0, "ell_rp": 1, "ell_s": 0, "phase1": 0, "phase2": 0, "iter": 1, "sign": 0},
-    32: {"work1": None,        "work2": None,        "ell_t": 6, "ell_q": 0, "ell_rp": 0, "ell_s": 0, "phase1": 0, "phase2": 0, "iter": 0, "sign": 0},
-    36: {"work1": None,        "work2": None,        "ell_t": 6, "ell_q": 0, "ell_rp": 0, "ell_s": 4, "phase1": 0, "phase2": 0, "iter": 0, "sign": 0},
-}
-
-
-def _append_table4_case_if_needed(
-    qc: QuantumCircuit,
-    *,
-    T_count: int,
-    n: int,
-    len_width: int,
-    shift_width: int,
-    regs: Sequence[QuantumRegister],
-) -> bool:
-    if n != 6 or T_count not in _TABLE4_LOOKUP_ROWS:
-        return False
-    row = _TABLE4_LOOKUP_ROWS[T_count]
-    Phase1, Phase2, Iter, Sign, Ctrl, Work1, Work2, l_t, l_q, l_s, l_rp, Aux = regs
-    flag = Aux[0]
-    scratch = list(Aux[1:])
-
-    p_value = 37
-    x_used = 13
-    w1_init = _work1_initial_bits_for_modulus(n, p_value)
-    w2_init = _work2_initial_bits_for_value(n, x_used)
-    lrp_init_value = x_used.bit_length() - 1
-    lq_init = (1 << len_width) - 1
-    ls_init = (1 << shift_width) - 1
-
-    initial_conditions: list[tuple[Qubit, int]] = []
-    initial_conditions += _conditions_for_bits(Work1, w1_init)
-    initial_conditions += _conditions_for_bits(Work2, w2_init)
-    initial_conditions += _conditions_for_bits(l_t, _bits_of_int_le(0, len_width))
-    initial_conditions += _conditions_for_bits(l_q, _bits_of_int_le(lq_init, len_width))
-    initial_conditions += _conditions_for_bits(l_s, _bits_of_int_le(ls_init, shift_width))
-    initial_conditions += _conditions_for_bits(l_rp, _bits_of_int_le(lrp_init_value, len_width))
-    initial_conditions += [(Phase1[0], 0), (Phase2[0], 0), (Iter[0], 0), (Sign[0], 0)]
-
-    final_work1 = list(w1_init) if row["work1"] is None else [int(c) for c in row["work1"]]
-    final_work2 = list(w2_init) if row["work2"] is None else [int(c) for c in row["work2"]]
-    if row["work2"] is None:
-        # Keep endpoint-visible t' correct once the example has terminated.
-        for i, b in enumerate(_bits_of_int_le(17, n)):
-            final_work2[i] = b
-    final_l_t = _enc_len_for_lookup(int(row["ell_t"]), len_width)
-    final_l_q = _enc_len_for_lookup(int(row["ell_q"]), len_width)
-    final_l_rp = _enc_len_for_lookup(int(row["ell_rp"]), len_width)
-    final_l_s = _enc_len_for_lookup(int(row["ell_s"]), shift_width)
-
-    final_conditions: list[tuple[Qubit, int]] = []
-    final_conditions += _conditions_for_bits(Work1, final_work1)
-    final_conditions += _conditions_for_bits(Work2, final_work2)
-    final_conditions += _conditions_for_bits(l_t, _bits_of_int_le(final_l_t, len_width))
-    final_conditions += _conditions_for_bits(l_q, _bits_of_int_le(final_l_q, len_width))
-    final_conditions += _conditions_for_bits(l_s, _bits_of_int_le(final_l_s, shift_width))
-    final_conditions += _conditions_for_bits(l_rp, _bits_of_int_le(final_l_rp, len_width))
-    final_conditions += [
-        (Phase1[0], int(row["phase1"])),
-        (Phase2[0], int(row["phase2"])),
-        (Iter[0], int(row["iter"])),
-        (Sign[0], int(row["sign"])),
-    ]
-
-    delta_targets: list[Qubit] = []
-    for i, (a, b) in enumerate(zip(w1_init, final_work1)):
-        if a ^ b:
-            delta_targets.append(Work1[i])
-    for i, (a, b) in enumerate(zip(w2_init, final_work2)):
-        if a ^ b:
-            delta_targets.append(Work2[i])
-    for reg, before, after, width in [
-        (l_t, 0, final_l_t, len_width),
-        (l_q, lq_init, final_l_q, len_width),
-        (l_s, ls_init, final_l_s, shift_width),
-        (l_rp, lrp_init_value, final_l_rp, len_width),
-    ]:
-        for i, bit in enumerate(_bits_of_int_le(before ^ after, width)):
-            if bit:
-                delta_targets.append(reg[i])
-    if int(row["phase1"]):
-        delta_targets.append(Phase1[0])
-    if int(row["phase2"]):
-        delta_targets.append(Phase2[0])
-    if int(row["iter"]):
-        delta_targets.append(Iter[0])
-    if int(row["sign"]):
-        delta_targets.append(Sign[0])
-
-    _append_transition_by_conditions(
-        qc,
-        initial_conditions=initial_conditions,
-        final_conditions=final_conditions,
-        delta_targets=delta_targets,
-        flag=flag,
-        scratch=scratch,
-    )
-    return True
-
-
-def _build_lookup_steps_circuit(
-    *,
-    n: int,
-    len_width: int,
-    shift_width: int,
-    T_max: int,
-    aux_size: Optional[int],
-) -> QuantumCircuit:
-    required_aux = max(
-        qiskit_paper_aux_size(n, len_width, shift_width, T_max, False),
-        2 * n + 4 * len_width + 2 * shift_width + 20,
-    )
-    if aux_size is None or aux_size < required_aux:
-        aux_size = required_aux
-    regs = make_global_registers(n=n, len_width=len_width, shift_width=shift_width, T_max=T_max, aux_size=aux_size)
-    qc = QuantumCircuit(*regs, name="MODINV_STEPS_TOFFOLI_TABLE")
-    Phase1, Phase2, Iter, Sign, Ctrl, Work1, Work2, l_t, l_q, l_s, l_rp, Aux = regs
-
-    _append_named_idle_blocks(qc, Ctrl[0])
-    used_table_row = _append_table4_case_if_needed(
-        qc, T_count=T_max, n=n, len_width=len_width, shift_width=shift_width, regs=regs
-    )
-
-    p_min = 1 if n == 1 else (1 << (n - 1))
-    p_max = (1 << n) - 1
-    for p_value in range(p_min, p_max + 1):
-        for x_used in range(1, p_value // 2 + 1):
-            if math.gcd(p_value, x_used) != 1:
-                continue
-            if used_table_row and p_value == 37 and x_used == 13:
-                continue
-            exact_steps, tprime, quotient_parity = _classical_expected_after_preprocessed_eea(p_value, x_used)
-            if T_max < exact_steps:
-                continue
-            _append_algorithm3_endpoint_case(
-                qc,
-                n=n,
-                len_width=len_width,
-                shift_width=shift_width,
-                p_value=p_value,
-                x_used=x_used,
-                exact_steps=exact_steps,
-                tprime=tprime,
-                quotient_parity=quotient_parity,
-                regs=regs,
-            )
-    return qc
-
+# Preserve the generic implementations for resource-development experiments,
+# but route the public API through the repaired S835 FASTDUAL scheduler.  The
+# import is deliberately lazy: ``eea_circuit_s835_fastdual`` imports this module
+# for primitive gates, so importing it here at module load time would create a
+# cycle.
+_build_full_steps_circuit_generic = build_full_steps_circuit
+_build_modular_inversion_algorithm1_circuit_generic = build_modular_inversion_algorithm1_circuit
 
 def build_full_steps_circuit(
     n: int,
@@ -3438,60 +3120,12 @@ def build_full_steps_circuit(
     shift_width: int,
     T_max: Optional[int] = None,
     aux_size: Optional[int] = None,
-) -> QuantumCircuit:  # type: ignore[override]
-    if T_max is None:
-        T_max = Nmax_steps(n)
-    if 0 < n < 7:
-        return _build_lookup_steps_circuit(
-            n=n,
-            len_width=len_width,
-            shift_width=shift_width,
-            T_max=T_max,
-            aux_size=aux_size,
-        )
-    return _build_full_steps_circuit_original(
-        n=n,
-        len_width=len_width,
-        shift_width=shift_width,
-        T_max=T_max,
-        aux_size=aux_size,
-    )
-
-
-def _build_algorithm1_lookup_circuit(
-    *,
-    n: int,
-    p: int,
-    len_width: int,
-    shift_width: int,
-    T_max: int,
 ) -> QuantumCircuit:
-    step_regs = make_global_registers(
-        n=n,
-        len_width=len_width,
-        shift_width=shift_width,
-        T_max=T_max,
-        include_algorithm1=True,
+    from eea_circuit_s835_fastdual import build_full_steps_circuit as _fixed_builder
+    return _fixed_builder(
+        n=n, len_width=len_width, shift_width=shift_width,
+        T_max=T_max, aux_size=aux_size,
     )
-    Output = QuantumRegister(n, "out")
-    qc = QuantumCircuit(*step_regs, Output, name="MODINV_ALG1_TOFFOLI_LOOKUP")
-    Phase1, Phase2, Iter, Sign, Ctrl, Work1, Work2, l_t, l_q, l_s, l_rp, Aux = step_regs
-    flag = Ctrl[0]
-    scratch = list(Aux)
-
-    for x_value in range(1, p):
-        if math.gcd(x_value, p) != 1:
-            continue
-        x_bits = _bits_of_int_be(x_value, n)
-        conditions = _conditions_for_bits(Work2[3: 3 + n], x_bits)
-        compute_control(qc, conditions, flag, scratch)
-        inv = pow(x_value, -1, p)
-        for i, bit in enumerate(_bits_of_int_le(inv, n)):
-            if bit:
-                qc.cx(flag, Output[i])
-        compute_control(qc, conditions, flag, scratch)
-    return qc
-
 
 def build_modular_inversion_algorithm1_circuit(
     *,
@@ -3500,32 +3134,11 @@ def build_modular_inversion_algorithm1_circuit(
     len_width: Optional[int] = None,
     shift_width: Optional[int] = None,
     T_max: Optional[int] = None,
-) -> QuantumCircuit:  # type: ignore[override]
-    _require_qiskit()
-    if not (0 < p < (1 << n)):
-        raise ValueError("p must be a positive n-bit modulus, i.e. 0 < p < 2^n")
-    if len_width is None:
-        len_width = get_n_config(n)["len_width"]
-    if shift_width is None:
-        shift_width = get_n_config(n)["shift_width"]
-    if T_max is None:
-        T_max = Nmax_steps(n)
-    if 0 < n < 7:
-        return _build_algorithm1_lookup_circuit(
-            n=n,
-            p=p,
-            len_width=len_width,
-            shift_width=shift_width,
-            T_max=T_max,
-        )
-    return _build_modular_inversion_algorithm1_circuit_original(
-        n=n,
-        p=p,
-        len_width=len_width,
-        shift_width=shift_width,
-        T_max=T_max,
+) -> QuantumCircuit:
+    from eea_circuit_s835_fastdual import build_modular_inversion_algorithm1_circuit as _fixed_builder
+    return _fixed_builder(
+        n=n, p=p, len_width=len_width, shift_width=shift_width, T_max=T_max,
     )
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Updated unary-iteration modular inversion circuit")

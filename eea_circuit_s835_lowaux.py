@@ -88,68 +88,135 @@ def lc_swap_unary_gate(*, k: int, K: int, len_width: int, name: str = "LC_SWAP_S
 
 
 @lru_cache(maxsize=None)
-def lc_interval_addsub_unary_gate(*, n:int,k:int,K:int,len_width:int,shift_width:int,
-                                  mode:Literal["add","sub"],sign_update:bool,
-                                  target:Literal["work1","work2"],name:str,
-                                  guard_lrp_width:int=0)->Gate:
-    if k>K: raise ValueError("need k <= K")
-    M=K-k+1; endpoint_width=max(len_width,shift_width)
-    scratch_size=max(endpoint_width+1,3+_scratch_for_eq(endpoint_width),4,max(0,guard_lrp_width-1)+3)
-    Ctrl=QuantumRegister(1,"Ctrl");Sign=QuantumRegister(1,"Sign");Work1=QuantumRegister(M,"Work1");Work2=QuantumRegister(M,"Work2")
-    l_t=QuantumRegister(len_width,"l_t");l_q=QuantumRegister(len_width,"l_q");l_s=QuantumRegister(shift_width,"l_s")
-    l_rp_guard=QuantumRegister(guard_lrp_width,"l_rp_guard") if guard_lrp_width else None
-    Scratch=QuantumRegister(scratch_size,"Scratch"); regs=[Ctrl,Sign,Work1,Work2,l_t,l_q,l_s]
-    if l_rp_guard is not None: regs.append(l_rp_guard)
-    regs.append(Scratch); qc=_e._block_circuit(*regs,name=name)
-    carry=Scratch[0]; const_scratch=list(Scratch[:endpoint_width+1])
-    qc.append(_e.cuccaro_add_mod_2n_no_z_gate(len_width,name="ADD_lt_to_lq"),list(l_t)+list(l_q)+[carry])
-    _e.add_const_mod_2n(qc,l_q,4,const_scratch[:len_width+1]);_e.const_minus_inplace(qc,l_s,n+2,const_scratch[:shift_width+1])
-    acc=Scratch[1];eq=Scratch[2];pool=list(Scratch[3:])
-    def qpair(j):
-        idx=j-k
-        if target=="work1":return Work2[idx],Work1[idx]
-        if target=="work2":return Work1[idx],Work2[idx]
-        raise ValueError("bad target")
-    for j in range(K,k-1,-1):
-        _toggle_eq_const_under_ctrl(qc,endpoint=l_s,const=j,ctrl=Ctrl[0],acc=acc,eq=eq,pool=pool)
-        a,t=qpair(j);_e._apply_cell(qc,mode,"first",acc,a,t,carry,pool)
-        _toggle_eq_const_under_ctrl(qc,endpoint=l_q,const=j,ctrl=Ctrl[0],acc=acc,eq=eq,pool=pool)
+def lc_interval_addsub_unary_gate(*, n: int, k: int, K: int, len_width: int, shift_width: int,
+                                  mode: Literal["add", "sub"], sign_update: bool,
+                                  target: Literal["work1", "work2"], name: str) -> Gate:
+    """Low-clean-aux two-endpoint location-controlled Add/Sub.
+
+    It preserves the exact endpoint logic of the original block:
+      L = ell_t + ell_q + 2, R = n + 3 - ell_s.
+    The active range accumulator is updated by equality tests for R and L while
+    scanning the work interval.  This replaces the two simultaneous unary paths
+    by one equality flag and one range accumulator.
+    """
+    if k > K:
+        raise ValueError("need k <= K")
+    M = K - k + 1
+    endpoint_width = max(len_width, shift_width)
+    scratch_size = max(
+        endpoint_width + 1,                  # endpoint affine transforms
+        3 + _scratch_for_eq(endpoint_width), # carry, active-acc, equality flag, equality pool
+        4,                                   # controlled 3-control Toffoli pool
+    )
+
+    Ctrl = QuantumRegister(1, "Ctrl")
+    Sign = QuantumRegister(1, "Sign")
+    Work1 = QuantumRegister(M, "Work1")
+    Work2 = QuantumRegister(M, "Work2")
+    l_t = QuantumRegister(len_width, "l_t")
+    l_q = QuantumRegister(len_width, "l_q")
+    l_s = QuantumRegister(shift_width, "l_s")
+    Scratch = QuantumRegister(scratch_size, "Scratch")
+    qc = _e._block_circuit(Ctrl, Sign, Work1, Work2, l_t, l_q, l_s, Scratch, name=name)
+
+    carry = Scratch[0]
+    const_scratch = list(Scratch[: endpoint_width + 1])
+
+    # Prepare raw L=(ell_t-1)+(ell_q-1)+4 and raw R=n+2-(ell_s-1).
+    qc.append(_e.cuccaro_add_mod_2n_no_z_gate(len_width, name="ADD_lt_to_lq"), list(l_t) + list(l_q) + [carry])
+    _e.add_const_mod_2n(qc, l_q, 4, const_scratch[: len_width + 1])
+    _e.const_minus_inplace(qc, l_s, n + 2, const_scratch[: shift_width + 1])
+
+    acc = Scratch[1]
+    eq = Scratch[2]
+    pool = list(Scratch[3:])
+
+    def qpair(j: int) -> tuple[Qubit, Qubit]:
+        idx = j - k
+        if target == "work1":
+            return Work2[idx], Work1[idx]
+        if target == "work2":
+            return Work1[idx], Work2[idx]
+        raise ValueError("target must be 'work1' or 'work2'")
+
+    # First pass: j = K, ..., k. Toggle active at R before the cell and at L after the cell.
+    for j in range(K, k - 1, -1):
+        _toggle_eq_const_under_ctrl(qc, endpoint=l_s, const=j, ctrl=Ctrl[0], acc=acc, eq=eq, pool=pool)
+        addend, tgt = qpair(j)
+        _e._apply_cell(qc, mode, "first", acc, addend, tgt, carry, pool)
+        _toggle_eq_const_under_ctrl(qc, endpoint=l_q, const=j, ctrl=Ctrl[0], acc=acc, eq=eq, pool=pool)
+
     if sign_update:
-        qc.cx(carry,Sign[0])
-        if l_rp_guard is not None:_e.mcx_vchain(qc,[carry]+list(l_rp_guard),Sign[0],list(Scratch))
-    for j in range(k,K+1):
-        _toggle_eq_const_under_ctrl(qc,endpoint=l_q,const=j,ctrl=Ctrl[0],acc=acc,eq=eq,pool=pool)
-        a,t=qpair(j);_e._apply_cell(qc,mode,"second",acc,a,t,carry,pool)
-        _toggle_eq_const_under_ctrl(qc,endpoint=l_s,const=j,ctrl=Ctrl[0],acc=acc,eq=eq,pool=pool)
-    _e.const_minus_inplace(qc,l_s,n+2,const_scratch[:shift_width+1]);_e.sub_const_mod_2n(qc,l_q,4,const_scratch[:len_width+1])
-    qc.append(_e.cuccaro_sub_mod_2n_no_z_gate(len_width,name="SUB_lt_from_lq"),list(l_t)+list(l_q)+[carry])
+        qc.cx(carry, Sign[0])
+
+    # Second pass: j = k, ..., K. Toggle at L before the cell and at R after the cell.
+    for j in range(k, K + 1):
+        _toggle_eq_const_under_ctrl(qc, endpoint=l_q, const=j, ctrl=Ctrl[0], acc=acc, eq=eq, pool=pool)
+        addend, tgt = qpair(j)
+        _e._apply_cell(qc, mode, "second", acc, addend, tgt, carry, pool)
+        _toggle_eq_const_under_ctrl(qc, endpoint=l_s, const=j, ctrl=Ctrl[0], acc=acc, eq=eq, pool=pool)
+
+    _e.const_minus_inplace(qc, l_s, n + 2, const_scratch[: shift_width + 1])
+    _e.sub_const_mod_2n(qc, l_q, 4, const_scratch[: len_width + 1])
+    qc.append(_e.cuccaro_sub_mod_2n_no_z_gate(len_width, name="SUB_lt_from_lq"), list(l_t) + list(l_q) + [carry])
     return _e._finalize_block(qc)
 
 
 @lru_cache(maxsize=None)
-def lc_prefix_addsub_unary_gate(*,k:int,K:int,len_width:int,mode:Literal["add","sub"],sign_update:bool,
-                                target:Literal["work1","work2"],name:str)->Gate:
-    if k>K: raise ValueError("need k <= K")
-    M=K-k+1;scratch_size=max(len_width+1,3+_scratch_for_eq(len_width),4)
-    Ctrl=QuantumRegister(1,"Ctrl");Sign=QuantumRegister(1,"Sign");Work1=QuantumRegister(M,"Work1");Work2=QuantumRegister(M,"Work2")
-    l_t=QuantumRegister(len_width,"l_t");Scratch=QuantumRegister(scratch_size,"Scratch");qc=_e._block_circuit(Ctrl,Sign,Work1,Work2,l_t,Scratch,name=name)
-    carry=Scratch[0];const_scratch=list(Scratch[:len_width+1]);_e.add_const_mod_2n(qc,l_t,2,const_scratch)
-    acc=Scratch[1];eq=Scratch[2];pool=list(Scratch[3:])
-    def qpair(j):
-        idx=j-k
-        if target=="work1":return Work2[idx],Work1[idx]
-        if target=="work2":return Work1[idx],Work2[idx]
-        raise ValueError("bad target")
-    qc.cx(Ctrl[0],acc)
-    for j in range(k,K+1):
-        a,t=qpair(j);_e._apply_cell(qc,mode,"first",acc,a,t,carry,pool)
-        _toggle_eq_const_under_ctrl(qc,endpoint=l_t,const=j,ctrl=Ctrl[0],acc=acc,eq=eq,pool=pool)
-    if sign_update:qc.cx(carry,Sign[0])
-    for j in range(K,k-1,-1):
-        _toggle_eq_const_under_ctrl(qc,endpoint=l_t,const=j,ctrl=Ctrl[0],acc=acc,eq=eq,pool=pool)
-        a,t=qpair(j);_e._apply_cell(qc,mode,"second",acc,a,t,carry,pool)
-        if j==k:qc.cx(Ctrl[0],acc)
-    _e.sub_const_mod_2n(qc,l_t,2,const_scratch);return _e._finalize_block(qc)
+def lc_prefix_addsub_unary_gate(*, k: int, K: int, len_width: int,
+                                mode: Literal["add", "sub"], sign_update: bool,
+                                target: Literal["work1", "work2"], name: str) -> Gate:
+    """Low-clean-aux t-side prefix arithmetic, including Phase-4 high lane."""
+    if k > K:
+        raise ValueError("need k <= K")
+    M = K - k + 1
+    scratch_size = max(len_width + 1, 3 + _scratch_for_eq(len_width), 4)
+
+    Ctrl = QuantumRegister(1, "Ctrl")
+    Phase2 = QuantumRegister(1, "Phase2")
+    Sign = QuantumRegister(1, "Sign")
+    Work1 = QuantumRegister(M, "Work1")
+    Work2 = QuantumRegister(M, "Work2")
+    l_t = QuantumRegister(len_width, "l_t")
+    Scratch = QuantumRegister(scratch_size, "Scratch")
+    qc = _e._block_circuit(Ctrl, Phase2, Sign, Work1, Work2, l_t, Scratch, name=name)
+
+    carry = Scratch[0]
+    const_scratch = list(Scratch[: len_width + 1])
+    _e.add_const_mod_2n(qc, l_t, 2, const_scratch)
+    _e.inc_mod2n_1ctrl(qc, Phase2[0], list(l_t), list(Scratch[:max(0, len_width - 1)]))
+
+    acc = Scratch[1]
+    eq = Scratch[2]
+    pool = list(Scratch[3:])
+
+    def qpair(j: int) -> tuple[Qubit, Qubit]:
+        idx = j - k
+        if target == "work1":
+            return Work2[idx], Work1[idx]
+        if target == "work2":
+            return Work1[idx], Work2[idx]
+        raise ValueError("target must be 'work1' or 'work2'")
+
+    qc.cx(Ctrl[0], acc)
+    for j in range(k, K + 1):
+        addend, tgt = qpair(j)
+        _e._apply_cell(qc, mode, "first", acc, addend, tgt, carry, pool)
+        _toggle_eq_const_under_ctrl(qc, endpoint=l_t, const=j, ctrl=Ctrl[0], acc=acc, eq=eq, pool=pool)
+
+    if sign_update:
+        qc.cx(carry, Sign[0])
+
+    for j in range(K, k - 1, -1):
+        _toggle_eq_const_under_ctrl(qc, endpoint=l_t, const=j, ctrl=Ctrl[0], acc=acc, eq=eq, pool=pool)
+        addend, tgt = qpair(j)
+        _e._apply_cell(qc, mode, "second", acc, addend, tgt, carry, pool)
+    qc.cx(Ctrl[0], acc)
+
+    _e.dec_mod2n_1ctrl(qc, Phase2[0], list(l_t), list(Scratch[:max(0, len_width - 1)]))
+    _e.sub_const_mod_2n(qc, l_t, 2, const_scratch)
+    return _e._finalize_block(qc)
+
 
 
 @lru_cache(maxsize=None)
@@ -210,7 +277,8 @@ def swap_work_and_len_unary_shared_gate(*, n: int, len_width: int, k4: int, K4: 
     """Full Work SWAP plus two serial length updates with one shared low-aux pool."""
     work_size = n + 3
     depth4 = _e.unary_depth(K4 - k4 + 1)
-    depth5 = _e.unary_depth(K5 - k5 + 1)
+    K5_decode = min(K5 + 1, n + 3)
+    depth5 = _e.unary_depth(K5_decode - k5 + 1)
     scratch4 = max(len_width + 1, depth4 + 2)
     scratch5 = max(len_width + 1, depth5 + 2)
     scratch_size = max(scratch4, scratch5)
@@ -230,8 +298,8 @@ def swap_work_and_len_unary_shared_gate(*, n: int, len_width: int, k4: int, K4: 
     _e._append_with_optional_clbits(qc, gate_lt, [Ctrl[0]] + list(Work1[k4 - 1:K4]) + list(Work2[k4 - 1:K4])
                                     + list(l_t) + list(l_rp) + list(Scratch[:scratch4]))
 
-    gate_lrp = len_update_lrp_unary_gate(n=n, k=k5, K=K5, len_width=len_width)
-    _e._append_with_optional_clbits(qc, gate_lrp, [Ctrl[0]] + list(Work1[k5 - 1:K5]) + list(Work2[k5 - 1:K5])
+    gate_lrp = len_update_lrp_unary_gate(n=n, k=k5, K=K5_decode, len_width=len_width)
+    _e._append_with_optional_clbits(qc, gate_lrp, [Ctrl[0]] + list(Work1[k5 - 1:K5_decode]) + list(Work2[k5 - 1:K5_decode])
                                     + list(l_t) + list(l_rp) + list(Scratch[:scratch5]))
     return _e._finalize_block(qc)
 

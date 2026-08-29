@@ -1,12 +1,19 @@
 import argparse
 import gc
 import json
+import hashlib
 import multiprocessing as _mp
 import time
 import traceback
 from collections import Counter
 from pathlib import Path
 from typing import Any
+
+try:
+    import qiskit  # type: ignore
+except Exception:
+    import mini_qiskit_runtime as _mini
+    _mini.install_as_qiskit()
 
 import eea_circuit_s835_fastdual as eea
 from ccx_recursive_block_counter import CounterPolicy
@@ -28,11 +35,29 @@ def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+def _normalized_policy_dict(value: dict[str, Any] | None) -> dict[str, Any]:
+    """Normalize JSON/runtime representation differences before comparison.
+
+    ``CounterPolicy.stop_prefixes`` is a tuple in Python and a list after JSON
+    serialization.  Treat those representations as identical so a valid
+    checkpoint is not needlessly recounted.
+    """
+    out = dict(value or {})
+    if "stop_prefixes" in out:
+        out["stop_prefixes"] = list(out.get("stop_prefixes") or [])
+    return out
+
+
 def _policy_matches(data: dict[str, Any], *, tpolicy: NCTTemplatePolicy, cpolicy: CounterPolicy) -> bool:
     # Fallback steps store the requested policy in nct_template_policy and the
     # actual rounds=0 policy in actual_nct_template_policy.  They should be
     # resumable under the requested policy because their counts are complete.
-    return data.get("nct_template_policy") == tpolicy.as_dict() and data.get("counter_policy") == cpolicy.as_dict()
+    return (
+        _normalized_policy_dict(data.get("nct_template_policy"))
+        == _normalized_policy_dict(tpolicy.as_dict())
+        and _normalized_policy_dict(data.get("counter_policy"))
+        == _normalized_policy_dict(cpolicy.as_dict())
+    )
 
 
 def _meta_from_ops(ops: Counter) -> dict[str, int]:
@@ -427,6 +452,24 @@ def count_range(
     }
 
 
+def _production_source_sha256() -> dict[str, str]:
+    """Hash the production sources that determine the emitted EEA steps."""
+    root = Path(__file__).resolve().parent
+    names = (
+        "eea_circuit_updated.py",
+        "eea_circuit_s835_fastdual.py",
+        "eea_circuit_s835_lowaux.py",
+        "under1000_eea_shared_s835_fastdual_wrapped.py",
+        "ccx_recursive_block_counter.py",
+        "nct_template_segment_optimizer.py",
+    )
+    out: dict[str, str] = {}
+    for name in names:
+        path = root / name
+        out[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return out
+
+
 def write_sum(
     out_path: Path,
     *,
@@ -466,6 +509,8 @@ def write_sum(
             "cx": int(total.get("cx", 0)),
         },
         "optimization_meta": _meta_from_ops(total),
+        "production_source_sha256": _production_source_sha256(),
+        "chunk_count": len(chunks),
         "chunks": [
             {
                 "range": c["range"],
