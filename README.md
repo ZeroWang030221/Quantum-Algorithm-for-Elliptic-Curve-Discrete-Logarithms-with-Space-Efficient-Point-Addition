@@ -464,26 +464,7 @@ p = 65521       : 41 / 41
 p = 4294967291  : 21 / 21
 ```
 
-### 7. ECDSAfail-style artifact-derived tests
-
-Goal: independently exercise the emitted Qiskit definitions using circuit-derived test inputs while separately checking classical output, measurement-dependent phase, and ancilla cleanup.
-
-Relevant files:
-
-```text
-official_style_qiskit_harness.py
-test_official_style_eea_harness.py
-test_official_style_point_add_harness.py
-test_official_style_point_add_roundtrip.py
-```
-
-The extended real-Qiskit run includes thousands of artifact-derived trajectories for EEA and complete small-field Figure-14 circuits.
-
-These tests are **ECDSAfail-style validation of the Qiskit implementation**. They are not the same as submitting a native KMX circuit to the official `ecdsafail` Rust grader.
-
-Direct official KMX validation requires a Qiskit-to-KMX lowering path and the interface expected by the official harness.
-
-### 8. Fail-closed recursive decomposition
+### 7. Fail-closed recursive decomposition
 
 Goal: ensure that an undecomposed arithmetic block, unsupported gate, or stopped subcircuit cannot be silently treated as one elementary operation.
 
@@ -509,7 +490,7 @@ The full no-opaque matrix also includes representative Algorithm-3 steps up to `
 
 ## Current validation status
 
-The base validation suite has been run under **real Qiskit 2.4.1** and completed successfully.
+The base validation suite has been run under **Qiskit 2.4.1** and completed successfully.
 
 Representative completed results include:
 
